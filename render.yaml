@@ -1,0 +1,63 @@
+services:
+  - type: web
+    name: miyou-feishu-automation
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scripts/automation_service.py
+    autoDeploy: false
+    plan: free
+    envVars:
+      - key: FEISHU_APP_ID
+        sync: false
+      - key: FEISHU_APP_SECRET
+        sync: false
+      - key: FEISHU_BASE_APP_TOKEN
+        sync: false
+      - key: FEISHU_BASE_URL
+        sync: false
+      - key: FEISHU_INTERVIEW_TABLE_ID
+        sync: false
+      - key: FEISHU_ANCHOR_TABLE_ID
+        sync: false
+      - key: FEISHU_NODE_TABLE_ID
+        sync: false
+      - key: FEISHU_REVIEW_TABLE_ID
+        sync: false
+      - key: FEISHU_VISUAL_TABLE_ID
+        sync: false
+      - key: FEISHU_TRAINING_TABLE_ID
+        sync: false
+      - key: FEISHU_TASK_TABLE_ID
+        sync: false
+      - key: FEISHU_FIRST_LIVE_TABLE_ID
+        sync: false
+      - key: FEISHU_PERSONNEL_TABLE_ID
+        sync: false
+      - key: FEISHU_WORKBENCH_TABLE_ID
+        sync: false
+      - key: FEISHU_RECRUITMENT_ENTRY_RECORD_ID
+        sync: false
+      - key: AUTOMATION_ENABLED
+        value: "false"
+      - key: CALENDAR_SYNC_ENABLED
+        value: "false"
+      - key: LOCAL_SCHEDULER_ENABLED
+        value: "true"
+      - key: CONTACT_FULL_SYNC_ENABLED
+        value: "true"
+      - key: PERSONNEL_DROPDOWN_SYNC_ENABLED
+        value: "true"
+      - key: REPORTING_SYNC_ENABLED
+        value: "false"
+      - key: LEGACY_ASSIGNMENT_BACKFILL_ENABLED
+        value: "false"
+      - key: AUTOMATION_CUTOVER_MS
+        sync: false
+      - key: AUTOMATION_ACTIVE_BATCH
+        sync: false
+      - key: JOB_TOKEN
+        generateValue: true
+      - key: PUBLIC_SERVICE_URL
+        value: "https://miyou-feishu-automation.onrender.com"
+      - key: MOBILE_FORM_TOKEN
+        sync: false
