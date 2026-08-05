@@ -807,7 +807,14 @@ def sync_anchor_display_names(fs: Feishu, out_dir: Path) -> dict[str, Any]:
     return report
 
 
-def build_chain(fs: Feishu, batch: str, limit: int, out_dir: Path, not_before_ms: int = 0) -> dict[str, Any]:
+def build_chain(
+    fs: Feishu,
+    batch: str,
+    limit: int,
+    out_dir: Path,
+    not_before_ms: int = 0,
+    recover_existing_links: bool = False,
+) -> dict[str, Any]:
     current_transfer = fs.search_records(TABLES["interview"], TRANSFER_TO_ANCHOR_FIELD)
     legacy_transfer = fs.search_records(TABLES["interview"], LEGACY_TRANSFER_TO_ANCHOR_FIELD)
     interviews_by_id = {record["record_id"]: record for record in [*current_transfer, *legacy_transfer] if record.get("record_id")}
@@ -818,12 +825,16 @@ def build_chain(fs: Feishu, batch: str, limit: int, out_dir: Path, not_before_ms
             anchors_by_source_interview.setdefault(interview_id, anchor)
 
     recovered_updates: list[dict[str, Any]] = []
+    skipped_existing_anchors = 0
     selected: list[dict[str, Any]] = []
     for record in interviews:
         existing_anchor = anchors_by_source_interview.get(record["record_id"])
         if existing_anchor:
             fields = record.get("fields") or {}
-            if not linked_record_ids(fields.get("关联主播档案")) or fields.get("系统：已生成主播档案") is not True:
+            if recover_existing_links and (
+                not linked_record_ids(fields.get("关联主播档案"))
+                or fields.get("系统：已生成主播档案") is not True
+            ):
                 recovered_updates.append(
                     {
                         "record_id": record["record_id"],
@@ -835,6 +846,8 @@ def build_chain(fs: Feishu, batch: str, limit: int, out_dir: Path, not_before_ms
                         },
                     }
                 )
+            else:
+                skipped_existing_anchors += 1
             continue
         if not eligible_interview(record, not_before_ms):
             continue
@@ -1037,7 +1050,9 @@ def build_chain(fs: Feishu, batch: str, limit: int, out_dir: Path, not_before_ms
     payload = {
         "batch": batch,
         "not_before_ms": not_before_ms,
+        "recovery_mode_enabled": recover_existing_links,
         "recovered_existing_anchors": len(recovered_updates),
+        "skipped_existing_anchors": skipped_existing_anchors,
         "recovered_interview_update_results": recovered_results,
         "selected_interviews": len(selected),
         "created_anchors": len(anchors),
