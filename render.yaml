@@ -49,6 +49,8 @@ services:
         value: "true"
       - key: REPORTING_SYNC_ENABLED
         value: "false"
+      - key: ANCHOR_MAINTENANCE_SYNC_ENABLED
+        value: "false"
       - key: LEGACY_ASSIGNMENT_BACKFILL_ENABLED
         value: "false"
       - key: AUTOMATION_CUTOVER_MS

@@ -99,6 +99,11 @@ def reporting_sync_enabled() -> bool:
     return os.environ.get("REPORTING_SYNC_ENABLED", "false").lower() == "true"
 
 
+def anchor_maintenance_sync_enabled() -> bool:
+    """Run expensive historical anchor maintenance only when explicitly enabled."""
+    return os.environ.get("ANCHOR_MAINTENANCE_SYNC_ENABLED", "false").lower() == "true"
+
+
 def run_personnel_dropdown_cycle() -> dict[str, object]:
     fs = Feishu(tenant_token())
     out_dir = Path("runtime")
@@ -151,8 +156,13 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
             out_dir=out_dir,
             not_before_ms=int(raw_cutover),
         )
-        photos = sync_interview_photos_to_anchors(fs, out_dir)
-        anchor_displays = sync_anchor_display_names(fs, out_dir)
+        if anchor_maintenance_sync_enabled():
+            photos = sync_interview_photos_to_anchors(fs, out_dir)
+            anchor_displays = sync_anchor_display_names(fs, out_dir)
+        else:
+            maintenance_reason = "Anchor maintenance sync is disabled."
+            photos = {"skipped": True, "reason": maintenance_reason}
+            anchor_displays = {"skipped": True, "reason": maintenance_reason}
         return {"batch": batch, "build": build, "photos": photos, "anchor_displays": anchor_displays}
     finally:
         ANCHOR_TRANSFER_LOCK.release()
@@ -238,6 +248,7 @@ def health() -> object:
             "legacy_assignment_backfill_enabled": legacy_assignment_backfill_enabled(),
             "personnel_dropdown_sync_enabled": personnel_dropdown_sync_enabled(),
             "reporting_sync_enabled": reporting_sync_enabled(),
+            "anchor_maintenance_sync_enabled": anchor_maintenance_sync_enabled(),
             "mobile_form_configured": bool(
                 os.environ.get("PUBLIC_SERVICE_URL", "").strip()
                 and os.environ.get("MOBILE_FORM_TOKEN", "").strip()
