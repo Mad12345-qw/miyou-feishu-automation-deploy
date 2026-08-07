@@ -122,7 +122,9 @@ def run_personnel_entry_cycle() -> dict[str, object]:
         out_dir = Path("runtime")
         personnel = sync_personnel_directory(fs, out_dir)
         surface = ensure_interview_workflow_surface(fs, out_dir)
-        dropdowns = sync_interview_personnel_dropdowns(fs, out_dir, sync_records=False)
+        # Desktop users select a visible name. Personal views filter the paired
+        # Feishu user field, so that field must be kept in sync on every cycle.
+        dropdowns = sync_interview_personnel_dropdowns(fs, out_dir, sync_records=True)
         personal_views = sync_missing_personal_entries(fs, out_dir)
         personal_workbench = sync_missing_workbench_rows(fs, out_dir)
         return {
@@ -223,7 +225,9 @@ def background_scheduler() -> None:
                     app.logger.exception("%s failed: %s", name, exc)
             time.sleep(interval)
 
-    base_interval = max(60, int(os.environ.get("AUTOMATION_INTERVAL_SECONDS", "300")))
+    # Keep employee entries and ownership routing responsive without relying on
+    # a user to re-enter the same assignment in a second table.
+    base_interval = max(60, int(os.environ.get("AUTOMATION_INTERVAL_SECONDS", "60")))
     workers = [
         ("Mobile form entry sync", base_interval, lambda: True, sync_mobile_form_entry),
         ("Personnel entry sync", max(60, min(base_interval, 180)), personnel_dropdown_sync_enabled, run_personnel_entry_cycle),

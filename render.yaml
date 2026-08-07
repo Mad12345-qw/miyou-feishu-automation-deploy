@@ -47,6 +47,8 @@ services:
         value: "true"
       - key: PERSONNEL_DROPDOWN_SYNC_ENABLED
         value: "true"
+      - key: AUTOMATION_INTERVAL_SECONDS
+        value: "60"
       - key: REPORTING_SYNC_ENABLED
         value: "false"
       - key: ANCHOR_MAINTENANCE_SYNC_ENABLED
