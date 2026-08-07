@@ -10,7 +10,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 
 from mobile_interview_form import register_mobile_interview_form
-from miyou_system_automation import Feishu, OPENAPI, build_chain, ensure_interview_workflow_surface, ensure_personal_views, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory
+from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory
 from run_miyou_rule_engine import reconcile
 from sync_missing_personal_entries import sync_missing_personal_entries
 from sync_missing_workbench_rows import sync_missing_workbench_rows
@@ -122,9 +122,7 @@ def run_personnel_entry_cycle() -> dict[str, object]:
         out_dir = Path("runtime")
         personnel = sync_personnel_directory(fs, out_dir)
         surface = ensure_interview_workflow_surface(fs, out_dir)
-        # Desktop users select a visible name. Personal views filter the paired
-        # Feishu user field, so that field must be kept in sync on every cycle.
-        dropdowns = sync_interview_personnel_dropdowns(fs, out_dir, sync_records=True)
+        dropdowns = sync_interview_personnel_dropdowns(fs, out_dir, sync_records=False)
         personal_views = sync_missing_personal_entries(fs, out_dir)
         personal_workbench = sync_missing_workbench_rows(fs, out_dir)
         return {
@@ -257,11 +255,39 @@ def health() -> object:
                 os.environ.get("PUBLIC_SERVICE_URL", "").strip()
                 and os.environ.get("MOBILE_FORM_TOKEN", "").strip()
             ),
+            "feishu_record_event_callback_ready": True,
             "schema_version": "2026-08-05-independent-personnel-and-transfer-cycles",
             "active_batch": os.environ.get("AUTOMATION_ACTIVE_BATCH", ""),
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
     )
+
+
+@app.post("/webhook/feishu")
+def feishu_record_event() -> object:
+    """Process a changed Base row immediately; repeated delivery is harmless."""
+    payload = request.get_json(silent=True) or {}
+    if payload.get("type") == "url_verification":
+        return jsonify({"challenge": payload.get("challenge", "")})
+
+    header = payload.get("header") or {}
+    event = payload.get("event") or {}
+    if str(event.get("app_token") or "") != APP_TOKEN:
+        return jsonify({"ok": True, "ignored": "other_app"})
+    table_id = str(event.get("table_id") or "")
+    record_id = str(event.get("record_id") or "")
+    if not record_id:
+        return jsonify({"ok": True, "ignored": "missing_record"})
+    fs = Feishu(tenant_token())
+    out_dir = Path("runtime")
+    if table_id == TABLES["interview"]:
+        result = sync_one_interview_personnel_assignment(fs, record_id, out_dir)
+        return jsonify({"ok": True, "kind": "interview_assignment", "updated_fields": result["updated_fields"]})
+    if table_id == TABLES["personnel"]:
+        result = sync_missing_personal_entries(fs, out_dir)
+        workbench = sync_missing_workbench_rows(fs, out_dir)
+        return jsonify({"ok": True, "kind": "personnel_entry", "views_created": len(result["view_sync"]["created"]), "workbench_created": workbench["created"]})
+    return jsonify({"ok": True, "ignored": "other_table", "event_type": header.get("event_type", "")})
 
 
 @app.post("/jobs/reconcile")

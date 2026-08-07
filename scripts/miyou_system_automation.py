@@ -1626,6 +1626,53 @@ def sync_interview_personnel_dropdowns(fs: Feishu, out_dir: Path, sync_records: 
     return report
 
 
+def sync_one_interview_personnel_assignment(fs: Feishu, record_id: str, out_dir: Path) -> dict[str, Any]:
+    """Resolve one changed interview row without scanning the whole interview table."""
+    response = fs.api("GET", f"/bitable/v1/apps/{APP_TOKEN}/tables/{TABLES['interview']}/records/{record_id}")
+    record = (response.get("data") or {}).get("record") or (response.get("data") or {})
+    if response.get("code") != 0 or not record.get("record_id"):
+        raise RuntimeError(f"Unable to read interview record {record_id}: {response}")
+
+    active_people: list[dict[str, Any]] = []
+    for person_record in fs.list_records(TABLES["personnel"], page_size=500):
+        fields = person_record.get("fields") or {}
+        if text_value(fields.get("在职状态")) != "在职" or text_value(fields.get("账号状态")) != "正常":
+            continue
+        name = text_value(fields.get("姓名")).strip()
+        users = [{"id": user_id} for user_id in user_ids(fields.get("飞书用户"))]
+        if name and users:
+            active_people.append({"name": name, "department": text_value(fields.get("组织部门")).strip(), "users": users})
+    name_counts: dict[str, int] = {}
+    for person in active_people:
+        name_counts[person["name"]] = name_counts.get(person["name"], 0) + 1
+    people_by_name: dict[str, list[dict[str, str]]] = {}
+    for person in active_people:
+        name = str(person["name"])
+        display_name = name
+        if name_counts[name] > 1:
+            display_name = f"{name}（{person['department'] or person['users'][0]['id'][-6:]}）"
+        people_by_name[display_name] = person["users"]
+
+    fields = record.get("fields") or {}
+    changed: dict[str, Any] = {}
+    unresolved: list[str] = []
+    for visible_name, spec in INTERVIEW_PERSONNEL_DROPDOWNS.items():
+        selected = text_value(fields.get(visible_name)).strip()
+        if not selected:
+            continue
+        users = people_by_name.get(selected)
+        if not users:
+            unresolved.append(selected)
+            continue
+        account_name = str(spec["account_field"])
+        if user_ids(fields.get(account_name)) != user_ids(users):
+            changed[account_name] = users
+    results = fs.batch_update(TABLES["interview"], [{"record_id": record_id, "fields": changed}]) if changed else []
+    report = {"record_id": record_id, "updated_fields": sorted(changed), "unresolved_values": sorted(set(unresolved)), "results": results}
+    write_json(out_dir / f"sync_interview_assignment_{record_id}.json", report)
+    return report
+
+
 def normalized_owner_names(*values: Any) -> set[str]:
     result: set[str] = set()
     for name in owner_names(*values):
