@@ -22,6 +22,8 @@ WORKBENCH_TABLE_ID = os.environ.get("FEISHU_WORKBENCH_TABLE_ID", "").strip()
 PERSONNEL_ENTRY_LOCK = threading.Lock()
 ANCHOR_TRANSFER_LOCK = threading.Lock()
 REPORTING_LOCK = threading.Lock()
+FEISHU_EVENT_LOCK = threading.Lock()
+LAST_FEISHU_RECORD_EVENT: dict[str, object] = {"received": False}
 
 
 def tenant_token() -> str:
@@ -238,8 +240,22 @@ def background_scheduler() -> None:
         time.sleep(3600)
 
 
+def note_feishu_record_event(event_type: str, table_kind: str) -> None:
+    with FEISHU_EVENT_LOCK:
+        LAST_FEISHU_RECORD_EVENT.update(
+            {
+                "received": True,
+                "event_type": event_type,
+                "table_kind": table_kind,
+                "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+        )
+
+
 @app.get("/health")
 def health() -> object:
+    with FEISHU_EVENT_LOCK:
+        last_event = dict(LAST_FEISHU_RECORD_EVENT)
     return jsonify(
         {
             "ok": True,
@@ -256,6 +272,7 @@ def health() -> object:
                 and os.environ.get("MOBILE_FORM_TOKEN", "").strip()
             ),
             "feishu_record_event_callback_ready": True,
+            "last_feishu_record_event": last_event,
             "schema_version": "2026-08-05-independent-personnel-and-transfer-cycles",
             "active_batch": os.environ.get("AUTOMATION_ACTIVE_BATCH", ""),
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -281,12 +298,10 @@ def feishu_record_event() -> object:
     fs = Feishu(tenant_token())
     out_dir = Path("runtime")
     if table_id == TABLES["interview"]:
+        note_feishu_record_event(str(header.get("event_type") or ""), "interview")
         result = sync_one_interview_personnel_assignment(fs, record_id, out_dir)
         return jsonify({"ok": True, "kind": "interview_assignment", "updated_fields": result["updated_fields"]})
-    if table_id == TABLES["personnel"]:
-        result = sync_missing_personal_entries(fs, out_dir)
-        workbench = sync_missing_workbench_rows(fs, out_dir)
-        return jsonify({"ok": True, "kind": "personnel_entry", "views_created": len(result["view_sync"]["created"]), "workbench_created": workbench["created"]})
+    note_feishu_record_event(str(header.get("event_type") or ""), "ignored")
     return jsonify({"ok": True, "ignored": "other_table", "event_type": header.get("event_type", "")})
 
 
