@@ -1354,8 +1354,13 @@ def sync_personnel_directory(fs: Feishu, out_dir: Path) -> dict[str, Any]:
         if not derived_roles:
             derived_roles.update(discovered.get(open_id, {}).get("roles") or set())
         employment_status, account_status = contact_status(user)
+        existing_record = existing_by_user.get(open_id)
+        existing_fields = (existing_record or {}).get("fields") or {}
+        display_name = name
+        if existing_fields.get("手工锁定角色") and text_value(existing_fields.get("姓名")).strip():
+            display_name = text_value(existing_fields.get("姓名")).strip()
         fields: dict[str, Any] = {
-            "姓名": name,
+            "姓名": display_name,
             "飞书用户": [{"id": open_id}],
             "在职状态": employment_status,
             "账号状态": account_status,
@@ -1372,8 +1377,6 @@ def sync_personnel_directory(fs: Feishu, out_dir: Path) -> dict[str, Any]:
         joined_at = epoch_ms(user.get("join_time"))
         if joined_at:
             fields["入职时间"] = joined_at
-        existing_record = existing_by_user.get(open_id)
-        existing_fields = (existing_record or {}).get("fields") or {}
         if not existing_fields.get("手工锁定角色") and derived_roles:
             fields["角色"] = sorted(derived_roles)
         if employment_status != "在职" and not existing_fields.get("离职时间"):
