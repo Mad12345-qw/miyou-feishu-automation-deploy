@@ -1542,13 +1542,20 @@ def sync_interview_personnel_dropdowns(fs: Feishu, out_dir: Path, sync_records: 
             if not required_roles or set(person["roles"]).intersection(required_roles)
         }
         dropdown_people[visible_name] = matches
-        desired_options = sorted(matches, key=lambda value: value.casefold())
         field = fields_by_name[visible_name]
         current_options = [
             str(option.get("name") or "")
             for option in ((field.get("property") or {}).get("options") or [])
             if option.get("name")
         ]
+        # Keep historical names as valid options. Replacing this list with only
+        # active employees makes Feishu clear older records that use former staff.
+        desired_options = list(current_options)
+        desired_options.extend(
+            name
+            for name in sorted(matches, key=lambda value: value.casefold())
+            if name not in desired_options
+        )
         if current_options != desired_options:
             response = fs.update_select_options(table_id, field, desired_options)
             option_updates.append({"field": visible_name, "options": desired_options, "response": response})
