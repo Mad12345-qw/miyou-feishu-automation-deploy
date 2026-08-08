@@ -719,6 +719,8 @@ def repair_relationship_fields(fs: Feishu, batch: str, out_dir: Path) -> dict[st
 
 def eligible_interview(record: dict[str, Any], not_before_ms: int = 0) -> bool:
     fields = record.get("fields") or {}
+    if "体验样本" in text_value(fields.get("候选人姓名")) or is_demo_batch(fields.get("自动化批次")):
+        return False
     linked_anchors = [
         record_id
         for item in (fields.get("关联主播档案") or [])
@@ -729,8 +731,6 @@ def eligible_interview(record: dict[str, Any], not_before_ms: int = 0) -> bool:
     if linked_anchors or fields.get("系统：已生成主播档案") is True:
         return False
     if fields.get(TRANSFER_TO_ANCHOR_FIELD) is not True and fields.get(LEGACY_TRANSFER_TO_ANCHOR_FIELD) is not True:
-        return False
-    if text_value(fields.get("面试状态")) != "已完成":
         return False
     workflow_time = fields.get("面试开始时间") or fields.get("面试时间") or fields.get("邀约时间")
     if not_before_ms and (not isinstance(workflow_time, (int, float)) or workflow_time < not_before_ms):
@@ -746,6 +746,39 @@ def linked_record_ids(value: Any) -> list[str]:
         for record_id in (item.get("record_ids") or [])
         if record_id
     ]
+
+
+def sync_selected_interview_assignments(fs: Feishu, records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Resolve only records about to enter the anchor workflow, not the full history."""
+    people: dict[str, list[dict[str, str]]] = {}
+    for person in fs.list_records(TABLES["personnel"], page_size=500):
+        fields = person.get("fields") or {}
+        if text_value(fields.get("在职状态")) != "在职" or text_value(fields.get("账号状态")) != "正常":
+            continue
+        name = text_value(fields.get("姓名")).strip()
+        users = [{"id": user_id} for user_id in user_ids(fields.get("飞书用户"))]
+        if name and users:
+            people[name] = users
+    updates: list[dict[str, Any]] = []
+    unresolved: set[str] = set()
+    for record in records:
+        fields = record.get("fields") or {}
+        changed: dict[str, Any] = {}
+        for visible_name, spec in INTERVIEW_PERSONNEL_DROPDOWNS.items():
+            selected = text_value(fields.get(visible_name)).strip()
+            if not selected:
+                continue
+            users = people.get(selected)
+            if not users:
+                unresolved.add(selected)
+                continue
+            account_name = str(spec["account_field"])
+            if user_ids(fields.get(account_name)) != user_ids(users):
+                changed[account_name] = users
+                fields[account_name] = users
+        if changed:
+            updates.append({"record_id": record["record_id"], "fields": changed})
+    return {"updated_records": len(updates), "unresolved_values": sorted(unresolved), "results": fs.batch_update(TABLES["interview"], updates, batch_size=100) if updates else []}
 
 
 def anchor_display_name(fields: dict[str, Any]) -> str:
@@ -856,6 +889,7 @@ def build_chain(
             break
 
     recovered_results = fs.batch_update(TABLES["interview"], recovered_updates, batch_size=500) if recovered_updates else []
+    assignment_sync = sync_selected_interview_assignments(fs, selected)
     anchor_records = []
     base_times: list[datetime] = []
     for index, record in enumerate(selected, start=1):
@@ -1053,6 +1087,7 @@ def build_chain(
         "recovery_mode_enabled": recover_existing_links,
         "recovered_existing_anchors": len(recovered_updates),
         "skipped_existing_anchors": skipped_existing_anchors,
+        "assignment_sync": assignment_sync,
         "recovered_interview_update_results": recovered_results,
         "selected_interviews": len(selected),
         "created_anchors": len(anchors),
