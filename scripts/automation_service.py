@@ -10,7 +10,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 
 from mobile_interview_form import register_mobile_interview_form
-from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory
+from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_interview_display_fields, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory
 from run_miyou_rule_engine import reconcile
 from sync_missing_personal_entries import sync_missing_personal_entries
 from sync_missing_workbench_rows import sync_missing_workbench_rows
@@ -115,7 +115,7 @@ def run_personnel_dropdown_cycle() -> dict[str, object]:
     return {"personnel": personnel, "dropdowns": dropdowns, "surface": surface}
 
 
-def run_personnel_entry_cycle(sync_records: bool = False) -> dict[str, object]:
+def run_personnel_entry_cycle() -> dict[str, object]:
     """Keep new employee entry creation independent from heavy business jobs."""
     if not PERSONNEL_ENTRY_LOCK.acquire(blocking=False):
         return {"skipped": True, "reason": "Personnel entry sync is already running."}
@@ -124,13 +124,15 @@ def run_personnel_entry_cycle(sync_records: bool = False) -> dict[str, object]:
         out_dir = Path("runtime")
         personnel = sync_personnel_directory(fs, out_dir)
         surface = ensure_interview_workflow_surface(fs, out_dir)
-        dropdowns = sync_interview_personnel_dropdowns(fs, out_dir, sync_records=sync_records)
+        dropdowns = sync_interview_personnel_dropdowns(fs, out_dir, sync_records=False)
+        display_repairs = sync_missing_interview_display_fields(fs, out_dir)
         personal_views = sync_missing_personal_entries(fs, out_dir)
         personal_workbench = sync_missing_workbench_rows(fs, out_dir)
         return {
             "personnel": personnel,
             "surface": surface,
             "dropdowns": dropdowns,
+            "display_repairs": display_repairs,
             "personal_views": personal_views,
             "personal_workbench": personal_workbench,
         }
@@ -231,12 +233,6 @@ def background_scheduler() -> None:
     workers = [
         ("Mobile form entry sync", base_interval, lambda: True, sync_mobile_form_entry),
         ("Personnel entry sync", max(60, min(base_interval, 180)), personnel_dropdown_sync_enabled, run_personnel_entry_cycle),
-        (
-            "Interview owner and date-group repair",
-            max(300, base_interval * 5),
-            personnel_dropdown_sync_enabled,
-            lambda: run_personnel_entry_cycle(sync_records=True),
-        ),
         ("Anchor transfer sync", max(60, min(base_interval, 180)), service_enabled, run_anchor_transfer_cycle),
         ("Reporting sync", max(300, base_interval * 3), lambda: service_enabled() and reporting_sync_enabled(), run_reporting_cycle),
     ]
@@ -352,7 +348,7 @@ def personnel_dropdown_job() -> object:
         authorize()
         if not personnel_dropdown_sync_enabled():
             return jsonify({"ok": True, "skipped": True, "reason": "Personnel dropdown sync is disabled."})
-        return jsonify({"ok": True, "result": run_personnel_entry_cycle(sync_records=True)})
+        return jsonify({"ok": True, "result": run_personnel_entry_cycle()})
     except PermissionError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 401
     except Exception as exc:

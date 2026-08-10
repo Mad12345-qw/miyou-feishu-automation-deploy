@@ -282,6 +282,33 @@ class Feishu:
             if not page_token:
                 return records
 
+    def search_records_by_filter(
+        self,
+        table_id: str,
+        conditions: list[dict[str, Any]],
+        page_size: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Read only records matching an explicit Base filter."""
+        records: list[dict[str, Any]] = []
+        page_token = ""
+        while True:
+            body: dict[str, Any] = {
+                "page_size": page_size,
+                "filter": {"conjunction": "and", "conditions": conditions},
+            }
+            if page_token:
+                body["page_token"] = page_token
+            data = self.api("POST", f"/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/records/search", body=body)
+            if data.get("code") != 0:
+                raise RuntimeError(f"Failed to search records in {table_id}: {data}")
+            payload = data.get("data") or {}
+            records.extend(payload.get("items") or [])
+            if not payload.get("has_more"):
+                return records
+            page_token = str(payload.get("page_token") or "")
+            if not page_token:
+                return records
+
     def batch_create(self, table_id: str, records: list[dict[str, Any]], batch_size: int = 500) -> list[dict[str, Any]]:
         results = []
         for start in range(0, len(records), batch_size):
@@ -1668,6 +1695,64 @@ def sync_interview_personnel_dropdowns(fs: Feishu, out_dir: Path, sync_records: 
         "update_results": update_results,
     }
     write_json(out_dir / "sync_interview_personnel_dropdowns_result.json", report)
+    return report
+
+
+def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path) -> dict[str, Any]:
+    """Repair only blank display fields that can be derived without guessing."""
+    table_id = TABLES["interview"]
+    updates_by_id: dict[str, dict[str, Any]] = {}
+    owner_repairs = {name: 0 for name in INTERVIEW_PERSONNEL_DROPDOWNS}
+
+    for visible_name, spec in INTERVIEW_PERSONNEL_DROPDOWNS.items():
+        account_name = str(spec["account_field"])
+        records = fs.search_records_by_filter(
+            table_id,
+            [
+                {"field_name": visible_name, "operator": "isEmpty", "value": []},
+                {"field_name": account_name, "operator": "isNotEmpty", "value": []},
+            ],
+        )
+        for record in records:
+            fields = record.get("fields") or {}
+            names = {
+                str(item.get("name") or item.get("en_name") or "").strip()
+                for item in (fields.get(account_name) or [])
+                if isinstance(item, dict) and (item.get("name") or item.get("en_name"))
+            }
+            if len(names) != 1:
+                continue
+            updates_by_id.setdefault(record["record_id"], {})[visible_name] = next(iter(names))
+            owner_repairs[visible_name] += 1
+
+    group_field = "邀约日期（按天分组）"
+    day_records = fs.search_records_by_filter(
+        table_id,
+        [
+            {"field_name": group_field, "operator": "isEmpty", "value": []},
+            {"field_name": "邀约时间", "operator": "isNotEmpty", "value": []},
+        ],
+    )
+    date_group_repairs = 0
+    for record in day_records:
+        day = invitation_day((record.get("fields") or {}).get("邀约时间"))
+        if not day:
+            continue
+        updates_by_id.setdefault(record["record_id"], {})[group_field] = day
+        date_group_repairs += 1
+
+    updates = [
+        {"record_id": record_id, "fields": fields}
+        for record_id, fields in updates_by_id.items()
+    ]
+    update_results = fs.batch_update(table_id, updates, batch_size=100) if updates else []
+    report = {
+        "records_updated": len(updates),
+        "owner_repairs": owner_repairs,
+        "date_group_repairs": date_group_repairs,
+        "update_results": update_results,
+    }
+    write_json(out_dir / "sync_missing_interview_display_fields_result.json", report)
     return report
 
 
