@@ -175,7 +175,10 @@ def render_interview_form(fs: Feishu, token: str, error: str = "") -> str:
     return page_shell("邀约与面试登记", body)
 
 
-def build_record_fields(fs: Feishu) -> dict[str, Any]:
+def build_record_fields(
+    fs: Feishu,
+    people: dict[str, list[dict[str, str]]] | None = None,
+) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "WPS记录ID": f"MOBILE-{datetime.now(SHANGHAI).strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3)}",
         "候选人姓名": request.form.get("candidate_name", "").strip(),
@@ -218,7 +221,7 @@ def build_record_fields(fs: Feishu) -> dict[str, Any]:
     if invite_day:
         fields["邀约日期（按天分组）"] = invite_day
 
-    people = active_people_by_name(fs)
+    people = people or active_people_by_name(fs)
     for visible_name, input_name in {"招募人": "recruiter", "面试官": "interviewer", "对接运营": "operator"}.items():
         selected = request.form.get(input_name, "").strip()
         if not selected:
@@ -247,11 +250,25 @@ def register_mobile_interview_form(app: Flask, tenant_token: Callable[[], str]) 
         invitation_time = request.form.get("invitation_time", "").strip()
         if not candidate_name or not recruiter or not invitation_time:
             return Response(render_interview_form(fs, provided, "请填写候选人姓名、招募人和邀约时间。"), status=400, mimetype="text/html")
+        people = active_people_by_name(fs)
+        selected_people = {
+            "招募人": recruiter,
+            "面试官": request.form.get("interviewer", "").strip(),
+            "对接运营": request.form.get("operator", "").strip(),
+        }
+        invalid_people = [label for label, selected in selected_people.items() if selected and not people.get(selected)]
+        if invalid_people:
+            labels = "、".join(invalid_people)
+            return Response(
+                render_interview_form(fs, provided, f"所选{labels}未绑定有效飞书账号，请刷新页面重新选择或联系管理员。"),
+                status=400,
+                mimetype="text/html",
+            )
         nonce = request.form.get("nonce", "").strip()
         if not claim_nonce(nonce):
             return Response(page_shell("请勿重复提交", '<div class="message"><h2>请勿重复提交</h2><p>这条登记已经处理，请返回飞书查看。</p></div>'), status=409, mimetype="text/html")
         try:
-            fields = build_record_fields(fs)
+            fields = build_record_fields(fs, people)
             results = fs.batch_create(TABLES["interview"], [{"fields": fields}], batch_size=1)
             result = results[0] if results else {}
             if result.get("code") != 0:
