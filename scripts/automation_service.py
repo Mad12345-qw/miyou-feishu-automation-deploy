@@ -115,7 +115,7 @@ def run_personnel_dropdown_cycle() -> dict[str, object]:
     return {"personnel": personnel, "dropdowns": dropdowns, "surface": surface}
 
 
-def run_personnel_entry_cycle() -> dict[str, object]:
+def run_personnel_entry_cycle(sync_records: bool = False) -> dict[str, object]:
     """Keep new employee entry creation independent from heavy business jobs."""
     if not PERSONNEL_ENTRY_LOCK.acquire(blocking=False):
         return {"skipped": True, "reason": "Personnel entry sync is already running."}
@@ -124,7 +124,7 @@ def run_personnel_entry_cycle() -> dict[str, object]:
         out_dir = Path("runtime")
         personnel = sync_personnel_directory(fs, out_dir)
         surface = ensure_interview_workflow_surface(fs, out_dir)
-        dropdowns = sync_interview_personnel_dropdowns(fs, out_dir, sync_records=False)
+        dropdowns = sync_interview_personnel_dropdowns(fs, out_dir, sync_records=sync_records)
         personal_views = sync_missing_personal_entries(fs, out_dir)
         personal_workbench = sync_missing_workbench_rows(fs, out_dir)
         return {
@@ -231,6 +231,12 @@ def background_scheduler() -> None:
     workers = [
         ("Mobile form entry sync", base_interval, lambda: True, sync_mobile_form_entry),
         ("Personnel entry sync", max(60, min(base_interval, 180)), personnel_dropdown_sync_enabled, run_personnel_entry_cycle),
+        (
+            "Interview owner and date-group repair",
+            max(300, base_interval * 5),
+            personnel_dropdown_sync_enabled,
+            lambda: run_personnel_entry_cycle(sync_records=True),
+        ),
         ("Anchor transfer sync", max(60, min(base_interval, 180)), service_enabled, run_anchor_transfer_cycle),
         ("Reporting sync", max(300, base_interval * 3), lambda: service_enabled() and reporting_sync_enabled(), run_reporting_cycle),
     ]
@@ -265,6 +271,7 @@ def health() -> object:
             "contact_full_sync_enabled": os.environ.get("CONTACT_FULL_SYNC_ENABLED", "false").lower() == "true",
             "legacy_assignment_backfill_enabled": legacy_assignment_backfill_enabled(),
             "personnel_dropdown_sync_enabled": personnel_dropdown_sync_enabled(),
+            "interview_owner_and_date_group_repair_enabled": personnel_dropdown_sync_enabled(),
             "reporting_sync_enabled": reporting_sync_enabled(),
             "anchor_maintenance_sync_enabled": anchor_maintenance_sync_enabled(),
             "mobile_form_configured": bool(
@@ -273,7 +280,7 @@ def health() -> object:
             ),
             "feishu_record_event_callback_ready": True,
             "last_feishu_record_event": last_event,
-            "schema_version": "2026-08-05-independent-personnel-and-transfer-cycles",
+            "schema_version": "2026-08-10-owner-and-date-group-repair",
             "active_batch": os.environ.get("AUTOMATION_ACTIVE_BATCH", ""),
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
@@ -345,7 +352,7 @@ def personnel_dropdown_job() -> object:
         authorize()
         if not personnel_dropdown_sync_enabled():
             return jsonify({"ok": True, "skipped": True, "reason": "Personnel dropdown sync is disabled."})
-        return jsonify({"ok": True, "result": run_personnel_entry_cycle()})
+        return jsonify({"ok": True, "result": run_personnel_entry_cycle(sync_records=True)})
     except PermissionError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 401
     except Exception as exc:
