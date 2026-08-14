@@ -23,7 +23,9 @@ PERSONNEL_ENTRY_LOCK = threading.Lock()
 ANCHOR_TRANSFER_LOCK = threading.Lock()
 REPORTING_LOCK = threading.Lock()
 FEISHU_EVENT_LOCK = threading.Lock()
+PROVISIONING_STATE_LOCK = threading.Lock()
 LAST_FEISHU_RECORD_EVENT: dict[str, object] = {"received": False}
+LAST_PERSONNEL_PROVISIONING: dict[str, object] = {"status": "not_run"}
 
 
 def tenant_token() -> str:
@@ -120,22 +122,52 @@ def run_personnel_entry_cycle() -> dict[str, object]:
     if not PERSONNEL_ENTRY_LOCK.acquire(blocking=False):
         return {"skipped": True, "reason": "Personnel entry sync is already running."}
     try:
-        fs = Feishu(tenant_token())
-        out_dir = Path("runtime")
-        personnel = sync_personnel_directory(fs, out_dir)
-        surface = ensure_interview_workflow_surface(fs, out_dir)
-        dropdowns = sync_interview_personnel_dropdowns(fs, out_dir, sync_records=False)
-        display_repairs = sync_missing_interview_display_fields(fs, out_dir)
-        personal_views = sync_missing_personal_entries(fs, out_dir)
-        personal_workbench = sync_missing_workbench_rows(fs, out_dir)
-        return {
-            "personnel": personnel,
-            "surface": surface,
-            "dropdowns": dropdowns,
-            "display_repairs": display_repairs,
-            "personal_views": personal_views,
-            "personal_workbench": personal_workbench,
-        }
+        try:
+            fs = Feishu(tenant_token())
+            out_dir = Path("runtime")
+            personnel = sync_personnel_directory(fs, out_dir)
+            surface = ensure_interview_workflow_surface(fs, out_dir)
+            dropdowns = sync_interview_personnel_dropdowns(fs, out_dir, sync_records=False)
+            display_repairs = sync_missing_interview_display_fields(fs, out_dir)
+            personal_views = sync_missing_personal_entries(fs, out_dir)
+            personal_workbench = sync_missing_workbench_rows(fs, out_dir)
+            business_failures = len(personal_views["view_sync"]["failed"])
+            workbench_view_failures = len(personal_views["workbench_view_sync"]["failed"])
+            workbench_row_failures = max(0, personal_workbench["desired_rows"] - personal_workbench["created"])
+            provisioning_status = "ok" if not (business_failures or workbench_view_failures or workbench_row_failures) else "degraded"
+            with PROVISIONING_STATE_LOCK:
+                LAST_PERSONNEL_PROVISIONING.update(
+                    {
+                        "status": provisioning_status,
+                        "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "people": personal_views["people"],
+                        "business_views_created": len(personal_views["view_sync"]["created"]),
+                        "business_view_failures": business_failures,
+                        "workbench_views_created": len(personal_views["workbench_view_sync"]["created"]),
+                        "workbench_views_repaired": len(personal_views["workbench_view_sync"]["repaired"]),
+                        "workbench_view_failures": workbench_view_failures,
+                        "workbench_rows_created": personal_workbench["created"],
+                        "workbench_row_failures": workbench_row_failures,
+                    }
+                )
+            return {
+                "personnel": personnel,
+                "surface": surface,
+                "dropdowns": dropdowns,
+                "display_repairs": display_repairs,
+                "personal_views": personal_views,
+                "personal_workbench": personal_workbench,
+            }
+        except Exception as exc:
+            with PROVISIONING_STATE_LOCK:
+                LAST_PERSONNEL_PROVISIONING.update(
+                    {
+                        "status": "failed",
+                        "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "error": str(exc),
+                    }
+                )
+            raise
     finally:
         PERSONNEL_ENTRY_LOCK.release()
 
@@ -258,6 +290,8 @@ def note_feishu_record_event(event_type: str, table_kind: str) -> None:
 def health() -> object:
     with FEISHU_EVENT_LOCK:
         last_event = dict(LAST_FEISHU_RECORD_EVENT)
+    with PROVISIONING_STATE_LOCK:
+        last_provisioning = dict(LAST_PERSONNEL_PROVISIONING)
     return jsonify(
         {
             "ok": True,
@@ -276,7 +310,8 @@ def health() -> object:
             ),
             "feishu_record_event_callback_ready": True,
             "last_feishu_record_event": last_event,
-            "schema_version": "2026-08-10-owner-and-date-group-repair",
+            "last_personnel_provisioning": last_provisioning,
+            "schema_version": "2026-08-14-personnel-provisioning-integrity",
             "active_batch": os.environ.get("AUTOMATION_ACTIVE_BATCH", ""),
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
