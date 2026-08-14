@@ -1698,8 +1698,8 @@ def sync_interview_personnel_dropdowns(fs: Feishu, out_dir: Path, sync_records: 
     return report
 
 
-def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path) -> dict[str, Any]:
-    """Repair only blank display fields that can be derived without guessing."""
+def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bool = False) -> dict[str, Any]:
+    """Keep derived owner and date-group display fields consistent."""
     table_id = TABLES["interview"]
     updates_by_id: dict[str, dict[str, Any]] = {}
     owner_repairs = {name: 0 for name in INTERVIEW_PERSONNEL_DROPDOWNS}
@@ -1728,28 +1728,31 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path) -> dict[str
     group_field = "邀约日期（按天分组）"
     day_records = fs.search_records_by_filter(
         table_id,
-        [
-            {"field_name": group_field, "operator": "isEmpty", "value": []},
-            {"field_name": "邀约时间", "operator": "isNotEmpty", "value": []},
-        ],
+        [{"field_name": "邀约时间", "operator": "isNotEmpty", "value": []}],
     )
     date_group_repairs = 0
+    date_group_changes: list[dict[str, str]] = []
     for record in day_records:
-        day = invitation_day((record.get("fields") or {}).get("邀约时间"))
-        if not day:
+        fields = record.get("fields") or {}
+        day = invitation_day(fields.get("邀约时间"))
+        current_day = text_value(fields.get(group_field)).strip()
+        if not day or current_day == day:
             continue
         updates_by_id.setdefault(record["record_id"], {})[group_field] = day
         date_group_repairs += 1
+        date_group_changes.append({"record_id": record["record_id"], "before": current_day, "after": day})
 
     updates = [
         {"record_id": record_id, "fields": fields}
         for record_id, fields in updates_by_id.items()
     ]
-    update_results = fs.batch_update(table_id, updates, batch_size=100) if updates else []
+    update_results = fs.batch_update(table_id, updates, batch_size=100) if updates and not dry_run else []
     report = {
+        "mode": "dry_run" if dry_run else "apply",
         "records_updated": len(updates),
         "owner_repairs": owner_repairs,
         "date_group_repairs": date_group_repairs,
+        "date_group_changes": date_group_changes,
         "update_results": update_results,
     }
     write_json(out_dir / "sync_missing_interview_display_fields_result.json", report)
@@ -1797,6 +1800,11 @@ def sync_one_interview_personnel_assignment(fs: Feishu, record_id: str, out_dir:
         account_name = str(spec["account_field"])
         if user_ids(fields.get(account_name)) != user_ids(users):
             changed[account_name] = users
+    group_field = "邀约日期（按天分组）"
+    desired_day = invitation_day(fields.get("邀约时间"))
+    current_day = text_value(fields.get(group_field)).strip()
+    if desired_day and desired_day != current_day:
+        changed[group_field] = desired_day
     results = fs.batch_update(TABLES["interview"], [{"record_id": record_id, "fields": changed}]) if changed else []
     report = {"record_id": record_id, "updated_fields": sorted(changed), "unresolved_values": sorted(set(unresolved)), "results": results}
     write_json(out_dir / f"sync_interview_assignment_{record_id}.json", report)
