@@ -22,6 +22,7 @@ WORKBENCH_TABLE_ID = os.environ.get("FEISHU_WORKBENCH_TABLE_ID", "").strip()
 PERSONNEL_ENTRY_LOCK = threading.Lock()
 ANCHOR_TRANSFER_LOCK = threading.Lock()
 REPORTING_LOCK = threading.Lock()
+INTERVIEW_INTEGRITY_LOCK = threading.Lock()
 FEISHU_EVENT_LOCK = threading.Lock()
 PROVISIONING_STATE_LOCK = threading.Lock()
 LAST_FEISHU_RECORD_EVENT: dict[str, object] = {"received": False}
@@ -125,10 +126,10 @@ def run_personnel_entry_cycle() -> dict[str, object]:
         try:
             fs = Feishu(tenant_token())
             out_dir = Path("runtime")
+            display_repairs = sync_missing_interview_display_fields(fs, out_dir)
             personnel = sync_personnel_directory(fs, out_dir)
             surface = ensure_interview_workflow_surface(fs, out_dir)
             dropdowns = sync_interview_personnel_dropdowns(fs, out_dir, sync_records=False)
-            display_repairs = sync_missing_interview_display_fields(fs, out_dir)
             personal_views = sync_missing_personal_entries(fs, out_dir)
             personal_workbench = sync_missing_workbench_rows(fs, out_dir)
             business_failures = len(personal_views["view_sync"]["failed"])
@@ -170,6 +171,15 @@ def run_personnel_entry_cycle() -> dict[str, object]:
             raise
     finally:
         PERSONNEL_ENTRY_LOCK.release()
+
+
+def run_interview_integrity_cycle() -> dict[str, object]:
+    if not INTERVIEW_INTEGRITY_LOCK.acquire(blocking=False):
+        return {"skipped": True, "reason": "Interview integrity sync is already running."}
+    try:
+        return sync_missing_interview_display_fields(Feishu(tenant_token()), Path("runtime"))
+    finally:
+        INTERVIEW_INTEGRITY_LOCK.release()
 
 
 def run_anchor_transfer_cycle() -> dict[str, object]:
@@ -264,6 +274,7 @@ def background_scheduler() -> None:
     base_interval = max(60, int(os.environ.get("AUTOMATION_INTERVAL_SECONDS", "60")))
     workers = [
         ("Mobile form entry sync", base_interval, lambda: True, sync_mobile_form_entry),
+        ("Interview integrity sync", base_interval, personnel_dropdown_sync_enabled, run_interview_integrity_cycle),
         ("Personnel entry sync", max(60, min(base_interval, 180)), personnel_dropdown_sync_enabled, run_personnel_entry_cycle),
         ("Anchor transfer sync", max(60, min(base_interval, 180)), service_enabled, run_anchor_transfer_cycle),
         ("Reporting sync", max(300, base_interval * 3), lambda: service_enabled() and reporting_sync_enabled(), run_reporting_cycle),

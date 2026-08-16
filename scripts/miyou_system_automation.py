@@ -370,6 +370,13 @@ def invitation_day(value: Any) -> str:
     return datetime.fromtimestamp(value / 1000, tz=timezone(timedelta(hours=8))).strftime("%Y/%m/%d")
 
 
+def invitation_day_group_is_formula(fields: list[dict[str, Any]]) -> bool:
+    return any(
+        field.get("field_name") == "邀约日期（按天分组）" and field.get("type") == 20
+        for field in fields
+    )
+
+
 def list_value(value: Any) -> list[str]:
     if value in (None, ""):
         return []
@@ -1651,7 +1658,12 @@ def sync_interview_personnel_dropdowns(fs: Feishu, out_dir: Path, sync_records: 
     backfilled_counts = {name: 0 for name in INTERVIEW_PERSONNEL_DROPDOWNS}
     unresolved: dict[str, set[str]] = {name: set() for name in INTERVIEW_PERSONNEL_DROPDOWNS}
     invitation_days_updated = 0
-    invitation_day_field = "邀约日期（按天分组）" if "邀约日期（按天分组）" in fields_by_name else ""
+    invitation_day_field = (
+        "邀约日期（按天分组）"
+        if "邀约日期（按天分组）" in fields_by_name
+        and fields_by_name["邀约日期（按天分组）"].get("type") != 20
+        else ""
+    )
     for record in fs.list_records(table_id, page_size=500):
         fields = record.get("fields") or {}
         changed: dict[str, Any] = {}
@@ -1725,10 +1737,15 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bo
             updates_by_id.setdefault(record["record_id"], {})[visible_name] = next(iter(names))
             owner_repairs[visible_name] += 1
 
-    group_field = "邀约日期（按天分组）"
-    day_records = fs.search_records_by_filter(
-        table_id,
-        [{"field_name": "邀约时间", "operator": "isNotEmpty", "value": []}],
+    formula_managed_date_group = invitation_day_group_is_formula(fs.fields(table_id))
+    group_field = "" if formula_managed_date_group else "邀约日期（按天分组）"
+    day_records = (
+        []
+        if formula_managed_date_group
+        else fs.search_records_by_filter(
+            table_id,
+            [{"field_name": "邀约时间", "operator": "isNotEmpty", "value": []}],
+        )
     )
     date_group_repairs = 0
     date_group_changes: list[dict[str, str]] = []
@@ -1752,6 +1769,7 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bo
         "records_updated": len(updates),
         "owner_repairs": owner_repairs,
         "date_group_repairs": date_group_repairs,
+        "date_group_formula_managed": formula_managed_date_group,
         "date_group_changes": date_group_changes,
         "update_results": update_results,
     }
@@ -1800,11 +1818,12 @@ def sync_one_interview_personnel_assignment(fs: Feishu, record_id: str, out_dir:
         account_name = str(spec["account_field"])
         if user_ids(fields.get(account_name)) != user_ids(users):
             changed[account_name] = users
-    group_field = "邀约日期（按天分组）"
-    desired_day = invitation_day(fields.get("邀约时间"))
-    current_day = text_value(fields.get(group_field)).strip()
-    if desired_day and desired_day != current_day:
-        changed[group_field] = desired_day
+    if not invitation_day_group_is_formula(fs.fields(TABLES["interview"])):
+        group_field = "邀约日期（按天分组）"
+        desired_day = invitation_day(fields.get("邀约时间"))
+        current_day = text_value(fields.get(group_field)).strip()
+        if desired_day and desired_day != current_day:
+            changed[group_field] = desired_day
     results = fs.batch_update(TABLES["interview"], [{"record_id": record_id, "fields": changed}]) if changed else []
     report = {"record_id": record_id, "updated_fields": sorted(changed), "unresolved_values": sorted(set(unresolved)), "results": results}
     write_json(out_dir / f"sync_interview_assignment_{record_id}.json", report)

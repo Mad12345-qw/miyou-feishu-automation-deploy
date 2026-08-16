@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from flask import Flask, Response, request
 
-from miyou_system_automation import INTERVIEW_PERSONNEL_DROPDOWNS, TABLES, TRANSFER_TO_ANCHOR_FIELD, Feishu, text_value, user_ids
+from miyou_system_automation import INTERVIEW_PERSONNEL_DROPDOWNS, TABLES, TRANSFER_TO_ANCHOR_FIELD, Feishu, invitation_day_group_is_formula, text_value, user_ids
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -218,7 +218,7 @@ def build_record_fields(
         if value is not None:
             fields[field_name] = value
     invite_day = invitation_day(request.form.get("invitation_time", "").strip())
-    if invite_day:
+    if invite_day and not invitation_day_group_is_formula(fs.fields(TABLES["interview"])):
         fields["邀约日期（按天分组）"] = invite_day
 
     people = people or active_people_by_name(fs)
