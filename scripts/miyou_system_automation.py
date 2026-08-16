@@ -128,7 +128,7 @@ def request_json(method: str, url: str, headers: dict[str, str] | None = None, b
         data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         merged_headers.setdefault("Content-Type", "application/json; charset=utf-8")
     last_error: Exception | None = None
-    for attempt in range(3):
+    for attempt in range(5):
         req = urllib.request.Request(url, data=data, headers=merged_headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=90) as resp:
@@ -136,10 +136,17 @@ def request_json(method: str, url: str, headers: dict[str, str] | None = None, b
                 return json.loads(text) if text else {}
         except urllib.error.HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
+            try:
+                error_payload = json.loads(text)
+            except json.JSONDecodeError:
+                error_payload = {}
+            if error_payload.get("code") == 1254607 and attempt < 4:
+                time.sleep(1 + attempt * 2)
+                continue
             raise RuntimeError(f"{method} {url} failed HTTP {exc.code}: {text}") from exc
         except (urllib.error.URLError, ConnectionResetError, TimeoutError) as exc:
             last_error = exc
-            if attempt < 2:
+            if attempt < 4:
                 time.sleep(1 + attempt * 2)
                 continue
             raise RuntimeError(f"{method} {url} failed after retry: {exc}") from exc
