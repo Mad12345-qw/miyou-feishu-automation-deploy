@@ -828,12 +828,14 @@ def sync_selected_interview_assignments(fs: Feishu, records: list[dict[str, Any]
             selected = text_value(fields.get(visible_name)).strip()
             if not selected:
                 continue
+            account_name = str(spec["account_field"])
+            current_user_ids = user_ids(fields.get(account_name))
             users = people.get(selected)
             if not users:
-                unresolved.add(selected)
+                if not current_user_ids:
+                    unresolved.add(selected)
                 continue
-            account_name = str(spec["account_field"])
-            if user_ids(fields.get(account_name)) != user_ids(users):
+            if current_user_ids != user_ids(users):
                 changed[account_name] = users
                 fields[account_name] = users
         if changed:

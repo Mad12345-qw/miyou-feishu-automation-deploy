@@ -384,7 +384,7 @@ def health() -> object:
             "last_personnel_provisioning": last_provisioning,
             "last_anchor_transfer": last_anchor_transfer,
             "anchor_transfer_wake_requested": anchor_transfer_wake_requested,
-            "schema_version": "2026-08-17-anchor-ownership-reconcile-v2",
+            "schema_version": "2026-08-17-anchor-ownership-reconcile-v3",
             "active_batch": os.environ.get("AUTOMATION_ACTIVE_BATCH", ""),
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
