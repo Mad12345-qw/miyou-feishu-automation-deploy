@@ -1817,24 +1817,58 @@ def sync_interview_personnel_dropdowns(fs: Feishu, out_dir: Path, sync_records: 
     return report
 
 
+def has_meaningful_field_value(value: Any) -> bool:
+    return value not in (None, "", [], {}) and value is not False
+
+
+def safe_to_attribute_recruiter_from_modifier(fields: dict[str, Any]) -> bool:
+    """Only infer a recruiter from the modifier while the row is still in recruitment."""
+    recruitment_fields = (
+        "候选人姓名",
+        "联系方式",
+        "投递渠道",
+        "年龄",
+        "面试岗位",
+        "面试地点",
+        "邀约时间",
+        "性别",
+        "城市",
+        "主播照片",
+    )
+    downstream_fields = (
+        "面试官",
+        "面试官账号（系统）",
+        "对接运营",
+        "对接运营账号（系统）",
+        "面试开始时间",
+        "面试结束时间",
+        "面试结果",
+        "面试状态",
+        TRANSFER_TO_ANCHOR_FIELD,
+        LEGACY_TRANSFER_TO_ANCHOR_FIELD,
+        "关联主播档案",
+        "是否生成主播档案",
+    )
+    return any(has_meaningful_field_value(fields.get(name)) for name in recruitment_fields) and not any(
+        has_meaningful_field_value(fields.get(name)) for name in downstream_fields
+    )
+
+
 def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bool = False) -> dict[str, Any]:
     """Keep derived owner and date-group display fields consistent."""
     table_id = TABLES["interview"]
     updates_by_id: dict[str, dict[str, Any]] = {}
     owner_repairs = {name: 0 for name in INTERVIEW_PERSONNEL_DROPDOWNS}
     creator_attribution_repairs = 0
+    modifier_attribution_repairs = 0
+    interview_records = fs.list_records(table_id, page_size=500)
 
     for visible_name, spec in INTERVIEW_PERSONNEL_DROPDOWNS.items():
         account_name = str(spec["account_field"])
-        records = fs.search_records_by_filter(
-            table_id,
-            [
-                {"field_name": visible_name, "operator": "isEmpty", "value": []},
-                {"field_name": account_name, "operator": "isNotEmpty", "value": []},
-            ],
-        )
-        for record in records:
+        for record in interview_records:
             fields = record.get("fields") or {}
+            if text_value(fields.get(visible_name)).strip() or not user_ids(fields.get(account_name)):
+                continue
             names = {
                 str(item.get("name") or item.get("en_name") or "").strip()
                 for item in (fields.get(account_name) or [])
@@ -1859,48 +1893,36 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bo
             for user_id in user_ids(fields.get("飞书用户")):
                 if name:
                     recruiters_by_user[user_id] = name
-        recent_response = fs.api(
-            "POST",
-            f"/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/records/search",
-            body={
-                "page_size": 500,
-                "sort": [{"field_name": SYSTEM_CREATED_AT_FIELD, "desc": True}],
-            },
-        )
-        creator_records = (recent_response.get("data") or {}).get("items") or []
-        for record in creator_records:
+        for record in interview_records:
             fields = record.get("fields") or {}
-            if (
-                not text_value(fields.get("候选人姓名")).strip()
-                or text_value(fields.get("招募人")).strip()
-                or user_ids(fields.get("招募人账号（系统）"))
-            ):
+            if text_value(fields.get("招募人")).strip() or user_ids(fields.get("招募人账号（系统）")):
                 continue
             creator_ids = user_ids(fields.get(SYSTEM_CREATED_BY_FIELD))
-            if len(creator_ids) != 1:
-                continue
-            recruiter_name = recruiters_by_user.get(creator_ids[0])
+            recruiter_id = creator_ids[0] if len(creator_ids) == 1 and creator_ids[0] in recruiters_by_user else ""
+            attribution_source = "creator"
+            if not recruiter_id and safe_to_attribute_recruiter_from_modifier(fields):
+                modifier_ids = user_ids(fields.get(SYSTEM_MODIFIED_BY_FIELD))
+                if len(modifier_ids) == 1 and modifier_ids[0] in recruiters_by_user:
+                    recruiter_id = modifier_ids[0]
+                    attribution_source = "modifier"
+            recruiter_name = recruiters_by_user.get(recruiter_id)
             if not recruiter_name:
                 continue
             updates_by_id.setdefault(record["record_id"], {}).update(
                 {
                     "招募人": recruiter_name,
-                    "招募人账号（系统）": [{"id": creator_ids[0]}],
+                    "招募人账号（系统）": [{"id": recruiter_id}],
                 }
             )
             owner_repairs["招募人"] += 1
-            creator_attribution_repairs += 1
+            if attribution_source == "creator":
+                creator_attribution_repairs += 1
+            else:
+                modifier_attribution_repairs += 1
 
     formula_managed_date_group = invitation_day_group_is_formula(table_fields)
     group_field = "" if formula_managed_date_group else "邀约日期（按天分组）"
-    day_records = (
-        []
-        if formula_managed_date_group
-        else fs.search_records_by_filter(
-            table_id,
-            [{"field_name": "邀约时间", "operator": "isNotEmpty", "value": []}],
-        )
-    )
+    day_records = [] if formula_managed_date_group else interview_records
     date_group_repairs = 0
     date_group_changes: list[dict[str, str]] = []
     for record in day_records:
@@ -1923,6 +1945,7 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bo
         "records_updated": len(updates),
         "owner_repairs": owner_repairs,
         "creator_attribution_repairs": creator_attribution_repairs,
+        "modifier_attribution_repairs": modifier_attribution_repairs,
         "date_group_repairs": date_group_repairs,
         "date_group_formula_managed": formula_managed_date_group,
         "date_group_changes": date_group_changes,
@@ -1947,32 +1970,61 @@ def sync_one_interview_personnel_assignment(fs: Feishu, record_id: str, out_dir:
         name = text_value(fields.get("姓名")).strip()
         users = [{"id": user_id} for user_id in user_ids(fields.get("飞书用户"))]
         if name and users:
-            active_people.append({"name": name, "department": text_value(fields.get("组织部门")).strip(), "users": users})
+            active_people.append(
+                {
+                    "name": name,
+                    "department": text_value(fields.get("组织部门")).strip(),
+                    "users": users,
+                    "roles": set(list_value(fields.get("角色"))),
+                }
+            )
     name_counts: dict[str, int] = {}
     for person in active_people:
         name_counts[person["name"]] = name_counts.get(person["name"], 0) + 1
     people_by_name: dict[str, list[dict[str, str]]] = {}
+    display_by_user_id: dict[str, str] = {}
+    recruiters_by_user_id: dict[str, str] = {}
     for person in active_people:
         name = str(person["name"])
         display_name = name
         if name_counts[name] > 1:
             display_name = f"{name}（{person['department'] or person['users'][0]['id'][-6:]}）"
         people_by_name[display_name] = person["users"]
+        for user in person["users"]:
+            user_id = str(user["id"])
+            display_by_user_id[user_id] = display_name
+            if "招募经纪人" in person["roles"]:
+                recruiters_by_user_id[user_id] = display_name
 
     fields = record.get("fields") or {}
     changed: dict[str, Any] = {}
     unresolved: list[str] = []
     for visible_name, spec in INTERVIEW_PERSONNEL_DROPDOWNS.items():
         selected = text_value(fields.get(visible_name)).strip()
+        account_name = str(spec["account_field"])
+        existing_ids = user_ids(fields.get(account_name))
         if not selected:
+            if len(existing_ids) == 1 and existing_ids[0] in display_by_user_id:
+                changed[visible_name] = display_by_user_id[existing_ids[0]]
             continue
         users = people_by_name.get(selected)
         if not users:
             unresolved.append(selected)
             continue
-        account_name = str(spec["account_field"])
-        if user_ids(fields.get(account_name)) != user_ids(users):
+        if existing_ids != user_ids(users):
             changed[account_name] = users
+    visible_recruiter = text_value(fields.get("招募人")).strip()
+    hidden_recruiter_ids = user_ids(fields.get("招募人账号（系统）"))
+    if not visible_recruiter and not hidden_recruiter_ids:
+        creator_ids = user_ids(fields.get(SYSTEM_CREATED_BY_FIELD))
+        recruiter_id = creator_ids[0] if len(creator_ids) == 1 and creator_ids[0] in recruiters_by_user_id else ""
+        if not recruiter_id and safe_to_attribute_recruiter_from_modifier(fields):
+            modifier_ids = user_ids(fields.get(SYSTEM_MODIFIED_BY_FIELD))
+            if len(modifier_ids) == 1 and modifier_ids[0] in recruiters_by_user_id:
+                recruiter_id = modifier_ids[0]
+        if recruiter_id:
+            changed["招募人"] = recruiters_by_user_id[recruiter_id]
+            changed["招募人账号（系统）"] = [{"id": recruiter_id}]
     if not invitation_day_group_is_formula(fs.fields(TABLES["interview"])):
         group_field = "邀约日期（按天分组）"
         desired_day = invitation_day(fields.get("邀约时间"))
