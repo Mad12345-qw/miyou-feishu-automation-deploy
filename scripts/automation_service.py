@@ -25,8 +25,10 @@ REPORTING_LOCK = threading.Lock()
 INTERVIEW_INTEGRITY_LOCK = threading.Lock()
 FEISHU_EVENT_LOCK = threading.Lock()
 PROVISIONING_STATE_LOCK = threading.Lock()
+ANCHOR_TRANSFER_STATE_LOCK = threading.Lock()
 LAST_FEISHU_RECORD_EVENT: dict[str, object] = {"received": False}
 LAST_PERSONNEL_PROVISIONING: dict[str, object] = {"status": "not_run"}
+LAST_ANCHOR_TRANSFER: dict[str, object] = {"status": "not_run"}
 
 
 def tenant_token() -> str:
@@ -188,6 +190,15 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
         raise RuntimeError("Automation is disabled. Set AUTOMATION_ENABLED=true after cutover approval.")
     if not ANCHOR_TRANSFER_LOCK.acquire(blocking=False):
         return {"skipped": True, "reason": "Anchor transfer sync is already running."}
+    started_at = datetime.now().astimezone()
+    with ANCHOR_TRANSFER_STATE_LOCK:
+        LAST_ANCHOR_TRANSFER.update(
+            {
+                "status": "running",
+                "started_at": started_at.isoformat(timespec="seconds"),
+                "trigger": threading.current_thread().name,
+            }
+        )
     try:
         batch = f"LIVE-{datetime.now().strftime('%Y%m%d')}"
         fs = Feishu(tenant_token())
@@ -207,9 +218,53 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
             maintenance_reason = "Anchor maintenance sync is disabled."
             photos = {"skipped": True, "reason": maintenance_reason}
             anchor_displays = {"skipped": True, "reason": maintenance_reason}
-        return {"batch": batch, "build": build, "photos": photos, "anchor_displays": anchor_displays}
+        result = {"batch": batch, "build": build, "photos": photos, "anchor_displays": anchor_displays}
+        finished_at = datetime.now().astimezone()
+        with ANCHOR_TRANSFER_STATE_LOCK:
+            LAST_ANCHOR_TRANSFER.update(
+                {
+                    "status": "ok",
+                    "finished_at": finished_at.isoformat(timespec="seconds"),
+                    "duration_seconds": round((finished_at - started_at).total_seconds(), 3),
+                    "batch": batch,
+                    "checked_records": build.get("checked_interviews", 0),
+                    "selected_records": build.get("selected_interviews", 0),
+                    "created_anchors": build.get("created_anchors", 0),
+                    "recovered_links": build.get("recovered_existing_anchors", 0),
+                    "unresolved_people": len((build.get("assignment_sync") or {}).get("unresolved_values") or []),
+                    "error": "",
+                }
+            )
+        return result
+    except Exception as exc:
+        finished_at = datetime.now().astimezone()
+        with ANCHOR_TRANSFER_STATE_LOCK:
+            LAST_ANCHOR_TRANSFER.update(
+                {
+                    "status": "failed",
+                    "finished_at": finished_at.isoformat(timespec="seconds"),
+                    "duration_seconds": round((finished_at - started_at).total_seconds(), 3),
+                    "error": str(exc),
+                }
+            )
+        raise
     finally:
         ANCHOR_TRANSFER_LOCK.release()
+
+
+def trigger_anchor_transfer_async(reason: str) -> bool:
+    """Wake a self-healing cycle without delaying health checks or Feishu callbacks."""
+    if not service_enabled() or ANCHOR_TRANSFER_LOCK.locked():
+        return False
+
+    def run() -> None:
+        try:
+            run_anchor_transfer_cycle()
+        except Exception as exc:
+            app.logger.exception("Async anchor transfer sync failed (%s): %s", reason, exc)
+
+    threading.Thread(target=run, daemon=True, name=f"Anchor transfer: {reason}").start()
+    return True
 
 
 def run_reporting_cycle() -> dict[str, object]:
@@ -301,6 +356,11 @@ def health() -> object:
         last_event = dict(LAST_FEISHU_RECORD_EVENT)
     with PROVISIONING_STATE_LOCK:
         last_provisioning = dict(LAST_PERSONNEL_PROVISIONING)
+    with ANCHOR_TRANSFER_STATE_LOCK:
+        last_anchor_transfer = dict(LAST_ANCHOR_TRANSFER)
+    anchor_transfer_wake_requested = False
+    if last_anchor_transfer.get("status") in {"not_run", "failed"}:
+        anchor_transfer_wake_requested = trigger_anchor_transfer_async("health wake")
     return jsonify(
         {
             "ok": True,
@@ -320,7 +380,9 @@ def health() -> object:
             "feishu_record_event_callback_ready": True,
             "last_feishu_record_event": last_event,
             "last_personnel_provisioning": last_provisioning,
-            "schema_version": "2026-08-14-personnel-provisioning-integrity",
+            "last_anchor_transfer": last_anchor_transfer,
+            "anchor_transfer_wake_requested": anchor_transfer_wake_requested,
+            "schema_version": "2026-08-17-anchor-transfer-self-healing",
             "active_batch": os.environ.get("AUTOMATION_ACTIVE_BATCH", ""),
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
@@ -347,7 +409,15 @@ def feishu_record_event() -> object:
     if table_id == TABLES["interview"]:
         note_feishu_record_event(str(header.get("event_type") or ""), "interview")
         result = sync_one_interview_personnel_assignment(fs, record_id, out_dir)
-        return jsonify({"ok": True, "kind": "interview_assignment", "updated_fields": result["updated_fields"]})
+        transfer_wake_requested = trigger_anchor_transfer_async("Feishu interview event")
+        return jsonify(
+            {
+                "ok": True,
+                "kind": "interview_assignment",
+                "updated_fields": result["updated_fields"],
+                "anchor_transfer_wake_requested": transfer_wake_requested,
+            }
+        )
     note_feishu_record_event(str(header.get("event_type") or ""), "ignored")
     return jsonify({"ok": True, "ignored": "other_table", "event_type": header.get("event_type", "")})
 

@@ -762,14 +762,7 @@ def eligible_interview(record: dict[str, Any], not_before_ms: int = 0) -> bool:
     fields = record.get("fields") or {}
     if "体验样本" in text_value(fields.get("候选人姓名")) or is_demo_batch(fields.get("自动化批次")):
         return False
-    linked_anchors = [
-        record_id
-        for item in (fields.get("关联主播档案") or [])
-        if isinstance(item, dict)
-        for record_id in (item.get("record_ids") or [])
-        if record_id
-    ]
-    if linked_anchors:
+    if linked_record_ids(fields.get("关联主播档案")):
         return False
     if fields.get(TRANSFER_TO_ANCHOR_FIELD) is not True and fields.get(LEGACY_TRANSFER_TO_ANCHOR_FIELD) is not True:
         return False
@@ -780,13 +773,20 @@ def eligible_interview(record: dict[str, Any], not_before_ms: int = 0) -> bool:
 
 
 def linked_record_ids(value: Any) -> list[str]:
-    return [
-        record_id
-        for item in (value or [])
-        if isinstance(item, dict)
-        for record_id in (item.get("record_ids") or [])
-        if record_id
-    ]
+    """Normalize relation fields returned by list, search, and single-record APIs."""
+    if isinstance(value, dict):
+        return [str(record_id) for record_id in (value.get("link_record_ids") or value.get("record_ids") or []) if record_id]
+    record_ids: list[str] = []
+    for item in value or []:
+        if isinstance(item, str):
+            record_ids.append(item)
+        elif isinstance(item, dict):
+            record_ids.extend(
+                str(record_id)
+                for record_id in (item.get("link_record_ids") or item.get("record_ids") or [])
+                if record_id
+            )
+    return record_ids
 
 
 def find_existing_anchor_for_interview(fs: Feishu, record: dict[str, Any]) -> dict[str, Any] | None:
@@ -1138,6 +1138,7 @@ def build_chain(
     interview_update_results = fs.batch_update(TABLES["interview"], interview_updates, batch_size=500)
     payload = {
         "batch": batch,
+        "checked_interviews": len(interviews),
         "not_before_ms": not_before_ms,
         "recovery_mode_enabled": recover_existing_links,
         "recovered_existing_anchors": len(recovered_updates),
