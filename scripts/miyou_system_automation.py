@@ -1821,20 +1821,26 @@ def has_meaningful_field_value(value: Any) -> bool:
     return value not in (None, "", [], {}) and value is not False
 
 
+RECRUITMENT_ATTRIBUTION_FIELDS = (
+    "候选人姓名",
+    "联系方式",
+    "投递渠道",
+    "年龄",
+    "面试岗位",
+    "面试地点",
+    "邀约时间",
+    "性别",
+    "城市",
+    "主播照片",
+)
+
+
+def has_recruitment_input(fields: dict[str, Any]) -> bool:
+    return any(has_meaningful_field_value(fields.get(name)) for name in RECRUITMENT_ATTRIBUTION_FIELDS)
+
+
 def safe_to_attribute_recruiter_from_modifier(fields: dict[str, Any]) -> bool:
     """Only infer a recruiter from the modifier while the row is still in recruitment."""
-    recruitment_fields = (
-        "候选人姓名",
-        "联系方式",
-        "投递渠道",
-        "年龄",
-        "面试岗位",
-        "面试地点",
-        "邀约时间",
-        "性别",
-        "城市",
-        "主播照片",
-    )
     downstream_fields = (
         "面试官",
         "面试官账号（系统）",
@@ -1849,7 +1855,7 @@ def safe_to_attribute_recruiter_from_modifier(fields: dict[str, Any]) -> bool:
         "关联主播档案",
         "是否生成主播档案",
     )
-    return any(has_meaningful_field_value(fields.get(name)) for name in recruitment_fields) and not any(
+    return has_recruitment_input(fields) and not any(
         has_meaningful_field_value(fields.get(name)) for name in downstream_fields
     )
 
@@ -1898,7 +1904,11 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bo
             if text_value(fields.get("招募人")).strip() or user_ids(fields.get("招募人账号（系统）")):
                 continue
             creator_ids = user_ids(fields.get(SYSTEM_CREATED_BY_FIELD))
-            recruiter_id = creator_ids[0] if len(creator_ids) == 1 and creator_ids[0] in recruiters_by_user else ""
+            recruiter_id = (
+                creator_ids[0]
+                if has_recruitment_input(fields) and len(creator_ids) == 1 and creator_ids[0] in recruiters_by_user
+                else ""
+            )
             attribution_source = "creator"
             if not recruiter_id and safe_to_attribute_recruiter_from_modifier(fields):
                 modifier_ids = user_ids(fields.get(SYSTEM_MODIFIED_BY_FIELD))
@@ -2017,7 +2027,11 @@ def sync_one_interview_personnel_assignment(fs: Feishu, record_id: str, out_dir:
     hidden_recruiter_ids = user_ids(fields.get("招募人账号（系统）"))
     if not visible_recruiter and not hidden_recruiter_ids:
         creator_ids = user_ids(fields.get(SYSTEM_CREATED_BY_FIELD))
-        recruiter_id = creator_ids[0] if len(creator_ids) == 1 and creator_ids[0] in recruiters_by_user_id else ""
+        recruiter_id = (
+            creator_ids[0]
+            if has_recruitment_input(fields) and len(creator_ids) == 1 and creator_ids[0] in recruiters_by_user_id
+            else ""
+        )
         if not recruiter_id and safe_to_attribute_recruiter_from_modifier(fields):
             modifier_ids = user_ids(fields.get(SYSTEM_MODIFIED_BY_FIELD))
             if len(modifier_ids) == 1 and modifier_ids[0] in recruiters_by_user_id:
