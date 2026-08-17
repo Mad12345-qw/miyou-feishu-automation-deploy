@@ -809,7 +809,7 @@ def find_existing_anchor_for_interview(fs: Feishu, record: dict[str, Any]) -> di
 
 
 def sync_selected_interview_assignments(fs: Feishu, records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Resolve only records about to enter the anchor workflow, not the full history."""
+    """Resolve visible personnel names to Feishu users for the supplied interviews."""
     people: dict[str, list[dict[str, str]]] = {}
     for person in fs.list_records(TABLES["personnel"], page_size=500):
         fields = person.get("fields") or {}
@@ -885,6 +885,16 @@ def sync_linked_anchor_operators(fs: Feishu, records: list[dict[str, Any]]) -> d
         "updated": len(updates),
         "missing_linked_anchor_ids": sorted(missing_ids),
         "results": fs.batch_update(TABLES["anchor"], updates, batch_size=100) if updates else [],
+    }
+
+
+def sync_interview_anchor_ownership(fs: Feishu, records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Resolve interview users first, then reconcile every linked anchor owner."""
+    assignment_sync = sync_selected_interview_assignments(fs, records)
+    anchor_operator_sync = sync_linked_anchor_operators(fs, records)
+    return {
+        "assignment_sync": assignment_sync,
+        "anchor_operator_sync": anchor_operator_sync,
     }
 
 
@@ -970,6 +980,8 @@ def build_chain(
                 not linked_record_ids(fields.get("关联主播档案"))
                 or fields.get("系统：已生成主播档案") is not True
             ):
+                fields["关联主播档案"] = [existing_anchor["record_id"]]
+                fields["系统：已生成主播档案"] = True
                 recovered_updates.append(
                     {
                         "record_id": record["record_id"],
@@ -991,8 +1003,9 @@ def build_chain(
             break
 
     recovered_results = fs.batch_update(TABLES["interview"], recovered_updates, batch_size=500) if recovered_updates else []
-    anchor_operator_sync = sync_linked_anchor_operators(fs, interviews)
-    assignment_sync = sync_selected_interview_assignments(fs, selected)
+    ownership_sync = sync_interview_anchor_ownership(fs, interviews)
+    assignment_sync = ownership_sync["assignment_sync"]
+    anchor_operator_sync = ownership_sync["anchor_operator_sync"]
     anchor_records = []
     base_times: list[datetime] = []
     for index, record in enumerate(selected, start=1):
