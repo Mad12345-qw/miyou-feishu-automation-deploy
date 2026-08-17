@@ -231,6 +231,8 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
                     "selected_records": build.get("selected_interviews", 0),
                     "created_anchors": build.get("created_anchors", 0),
                     "recovered_links": build.get("recovered_existing_anchors", 0),
+                    "updated_operator_assignments": (build.get("anchor_operator_sync") or {}).get("updated", 0),
+                    "missing_linked_anchors": len((build.get("anchor_operator_sync") or {}).get("missing_linked_anchor_ids") or []),
                     "unresolved_people": len((build.get("assignment_sync") or {}).get("unresolved_values") or []),
                     "error": "",
                 }

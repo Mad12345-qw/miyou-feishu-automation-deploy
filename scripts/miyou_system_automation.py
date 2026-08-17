@@ -841,6 +841,53 @@ def sync_selected_interview_assignments(fs: Feishu, records: list[dict[str, Any]
     return {"updated_records": len(updates), "unresolved_values": sorted(unresolved), "results": fs.batch_update(TABLES["interview"], updates, batch_size=100) if updates else []}
 
 
+def sync_linked_anchor_operators(fs: Feishu, records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Keep an existing anchor in the operator view selected on its interview row."""
+    assignments: dict[str, list[dict[str, str]]] = {}
+    for record in records:
+        fields = record.get("fields") or {}
+        linked_ids = linked_record_ids(fields.get("关联主播档案"))
+        owner_ids = user_ids(fields.get("对接运营账号（系统）"))
+        if len(linked_ids) == 1 and owner_ids:
+            assignments[linked_ids[0]] = [{"id": owner_id} for owner_id in owner_ids]
+
+    current_by_owner: dict[str, set[str]] = {}
+    for owner_id in sorted({item["id"] for values in assignments.values() for item in values}):
+        current_by_owner[owner_id] = {
+            str(item.get("record_id") or "")
+            for item in fs.search_records(TABLES["anchor"], "运营经济人", owner_id, page_size=100)
+        }
+    candidates = {
+        anchor_id: owners
+        for anchor_id, owners in assignments.items()
+        if any(anchor_id not in current_by_owner.get(owner["id"], set()) for owner in owners)
+    }
+
+    existing_ids: set[str] = set()
+    missing_ids: set[str] = set()
+
+    def anchor_exists(anchor_id: str) -> tuple[str, bool]:
+        response = fs.api("GET", f"/bitable/v1/apps/{APP_TOKEN}/tables/{TABLES['anchor']}/records/{anchor_id}")
+        return anchor_id, response.get("code") == 0 and bool((response.get("data") or {}).get("record"))
+
+    with ThreadPoolExecutor(max_workers=min(5, max(1, len(candidates)))) as pool:
+        futures = [pool.submit(anchor_exists, anchor_id) for anchor_id in candidates]
+        for future in as_completed(futures):
+            anchor_id, exists = future.result()
+            (existing_ids if exists else missing_ids).add(anchor_id)
+
+    updates = [
+        {"record_id": anchor_id, "fields": {"运营经济人": candidates[anchor_id]}}
+        for anchor_id in sorted(existing_ids)
+    ]
+    return {
+        "checked_assignments": len(assignments),
+        "updated": len(updates),
+        "missing_linked_anchor_ids": sorted(missing_ids),
+        "results": fs.batch_update(TABLES["anchor"], updates, batch_size=100) if updates else [],
+    }
+
+
 def anchor_display_name(fields: dict[str, Any]) -> str:
     nickname = (
         text_value(fields.get(ANCHOR_NAME_FIELD)).strip()
@@ -944,6 +991,7 @@ def build_chain(
             break
 
     recovered_results = fs.batch_update(TABLES["interview"], recovered_updates, batch_size=500) if recovered_updates else []
+    anchor_operator_sync = sync_linked_anchor_operators(fs, interviews)
     assignment_sync = sync_selected_interview_assignments(fs, selected)
     anchor_records = []
     base_times: list[datetime] = []
@@ -1144,6 +1192,7 @@ def build_chain(
         "recovered_existing_anchors": len(recovered_updates),
         "skipped_existing_anchors": skipped_existing_anchors,
         "assignment_sync": assignment_sync,
+        "anchor_operator_sync": anchor_operator_sync,
         "recovered_interview_update_results": recovered_results,
         "selected_interviews": len(selected),
         "created_anchors": len(anchors),
