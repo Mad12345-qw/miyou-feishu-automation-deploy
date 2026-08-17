@@ -57,6 +57,10 @@ TRANSFER_TO_ANCHOR_FIELD = "通过转入主播"
 LEGACY_TRANSFER_TO_ANCHOR_FIELD = "面试通过，转入主播"
 ANCHOR_DISPLAY_FIELD = "主播昵称（编号）"
 ANCHOR_NAME_FIELD = "主播名字"
+SYSTEM_CREATED_BY_FIELD = "系统：创建人"
+SYSTEM_CREATED_AT_FIELD = "系统：创建时间"
+SYSTEM_MODIFIED_BY_FIELD = "系统：最后修改人"
+SYSTEM_MODIFIED_AT_FIELD = "系统：最后修改时间"
 ANCHOR_DISPLAY_TABLES = {
     "node": {"link_field": "关联主播", "legacy_field": "关联主播编号"},
     "task": {"link_field": "对应主播", "legacy_field": "对应主播编号"},
@@ -76,6 +80,10 @@ FIELD_TYPES = {
     "attachment": 17,
     "link": 18,
     "user": 11,
+    "created_time": 1001,
+    "modified_time": 1002,
+    "created_user": 1003,
+    "modified_user": 1004,
 }
 
 CHAIN_NODE_TEMPLATE = [
@@ -444,6 +452,10 @@ def ensure_fields(fs: Feishu, out_dir: Path) -> dict[str, Any]:
             ("招募人账号（系统）", "user", None),
             ("面试官账号（系统）", "user", None),
             ("对接运营账号（系统）", "user", None),
+            (SYSTEM_CREATED_BY_FIELD, "created_user", None),
+            (SYSTEM_CREATED_AT_FIELD, "created_time", None),
+            (SYSTEM_MODIFIED_BY_FIELD, "modified_user", None),
+            (SYSTEM_MODIFIED_AT_FIELD, "modified_time", None),
             ("邀约时间", "datetime", None),
             ("面试开始时间", "datetime", None),
             ("面试结束时间", "datetime", None),
@@ -598,6 +610,10 @@ def ensure_interview_workflow_surface(fs: Feishu, out_dir: Path) -> dict[str, An
         "招募人账号（系统）",
         "面试官账号（系统）",
         "对接运营账号（系统）",
+        SYSTEM_CREATED_BY_FIELD,
+        SYSTEM_CREATED_AT_FIELD,
+        SYSTEM_MODIFIED_BY_FIELD,
+        SYSTEM_MODIFIED_AT_FIELD,
         "系统：已生成主播档案",
         "自动化批次",
         "系统处理状态",
@@ -844,48 +860,53 @@ def sync_selected_interview_assignments(fs: Feishu, records: list[dict[str, Any]
 
 
 def sync_linked_anchor_operators(fs: Feishu, records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Keep an existing anchor in the operator view selected on its interview row."""
-    assignments: dict[str, list[dict[str, str]]] = {}
+    """Keep recruiter, interviewer, and operator ownership aligned on linked anchors."""
+    assignment_fields = {
+        "招募人账号（系统）": "招募经济人",
+        "面试官账号（系统）": "面试官",
+        "对接运营账号（系统）": "运营经济人",
+    }
+    assignments: dict[str, dict[str, list[dict[str, str]]]] = {}
     for record in records:
         fields = record.get("fields") or {}
         linked_ids = linked_record_ids(fields.get("关联主播档案"))
-        owner_ids = user_ids(fields.get("对接运营账号（系统）"))
-        if len(linked_ids) == 1 and owner_ids:
-            assignments[linked_ids[0]] = [{"id": owner_id} for owner_id in owner_ids]
+        if len(linked_ids) != 1:
+            continue
+        desired: dict[str, list[dict[str, str]]] = {}
+        for interview_field, anchor_field in assignment_fields.items():
+            ids = user_ids(fields.get(interview_field))
+            if ids:
+                desired[anchor_field] = [{"id": user_id} for user_id in ids]
+        if desired:
+            assignments[linked_ids[0]] = desired
 
-    current_by_owner: dict[str, set[str]] = {}
-    for owner_id in sorted({item["id"] for values in assignments.values() for item in values}):
-        current_by_owner[owner_id] = {
-            str(item.get("record_id") or "")
-            for item in fs.search_records(TABLES["anchor"], "运营经济人", owner_id, page_size=100)
-        }
-    candidates = {
-        anchor_id: owners
-        for anchor_id, owners in assignments.items()
-        if any(anchor_id not in current_by_owner.get(owner["id"], set()) for owner in owners)
+    anchors_by_id = {
+        str(anchor.get("record_id") or ""): anchor
+        for anchor in fs.list_records(TABLES["anchor"], page_size=500)
+        if anchor.get("record_id")
     }
-
-    existing_ids: set[str] = set()
-    missing_ids: set[str] = set()
-
-    def anchor_exists(anchor_id: str) -> tuple[str, bool]:
-        response = fs.api("GET", f"/bitable/v1/apps/{APP_TOKEN}/tables/{TABLES['anchor']}/records/{anchor_id}")
-        return anchor_id, response.get("code") == 0 and bool((response.get("data") or {}).get("record"))
-
-    with ThreadPoolExecutor(max_workers=min(5, max(1, len(candidates)))) as pool:
-        futures = [pool.submit(anchor_exists, anchor_id) for anchor_id in candidates]
-        for future in as_completed(futures):
-            anchor_id, exists = future.result()
-            (existing_ids if exists else missing_ids).add(anchor_id)
-
-    updates = [
-        {"record_id": anchor_id, "fields": {"运营经济人": candidates[anchor_id]}}
-        for anchor_id in sorted(existing_ids)
-    ]
+    missing_ids = sorted(set(assignments) - set(anchors_by_id))
+    updates: list[dict[str, Any]] = []
+    updated_fields = {field_name: 0 for field_name in assignment_fields.values()}
+    for anchor_id, desired in assignments.items():
+        anchor = anchors_by_id.get(anchor_id)
+        if not anchor:
+            continue
+        current = anchor.get("fields") or {}
+        changed = {
+            field_name: users
+            for field_name, users in desired.items()
+            if set(user_ids(current.get(field_name))) != set(user_ids(users))
+        }
+        if changed:
+            updates.append({"record_id": anchor_id, "fields": changed})
+            for field_name in changed:
+                updated_fields[field_name] += 1
     return {
         "checked_assignments": len(assignments),
         "updated": len(updates),
-        "missing_linked_anchor_ids": sorted(missing_ids),
+        "updated_fields": updated_fields,
+        "missing_linked_anchor_ids": missing_ids,
         "results": fs.batch_update(TABLES["anchor"], updates, batch_size=100) if updates else [],
     }
 
@@ -1801,6 +1822,7 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bo
     table_id = TABLES["interview"]
     updates_by_id: dict[str, dict[str, Any]] = {}
     owner_repairs = {name: 0 for name in INTERVIEW_PERSONNEL_DROPDOWNS}
+    creator_attribution_repairs = 0
 
     for visible_name, spec in INTERVIEW_PERSONNEL_DROPDOWNS.items():
         account_name = str(spec["account_field"])
@@ -1823,7 +1845,53 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bo
             updates_by_id.setdefault(record["record_id"], {})[visible_name] = next(iter(names))
             owner_repairs[visible_name] += 1
 
-    formula_managed_date_group = invitation_day_group_is_formula(fs.fields(table_id))
+    table_fields = fs.fields(table_id)
+    field_names = {str(field.get("field_name") or "") for field in table_fields}
+    if SYSTEM_CREATED_BY_FIELD in field_names:
+        recruiters_by_user: dict[str, str] = {}
+        for person in fs.list_records(TABLES["personnel"], page_size=500):
+            fields = person.get("fields") or {}
+            if text_value(fields.get("在职状态")) != "在职" or text_value(fields.get("账号状态")) != "正常":
+                continue
+            if "招募经纪人" not in set(list_value(fields.get("角色"))):
+                continue
+            name = text_value(fields.get("姓名")).strip()
+            for user_id in user_ids(fields.get("飞书用户")):
+                if name:
+                    recruiters_by_user[user_id] = name
+        recent_response = fs.api(
+            "POST",
+            f"/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/records/search",
+            body={
+                "page_size": 500,
+                "sort": [{"field_name": SYSTEM_CREATED_AT_FIELD, "desc": True}],
+            },
+        )
+        creator_records = (recent_response.get("data") or {}).get("items") or []
+        for record in creator_records:
+            fields = record.get("fields") or {}
+            if (
+                not text_value(fields.get("候选人姓名")).strip()
+                or text_value(fields.get("招募人")).strip()
+                or user_ids(fields.get("招募人账号（系统）"))
+            ):
+                continue
+            creator_ids = user_ids(fields.get(SYSTEM_CREATED_BY_FIELD))
+            if len(creator_ids) != 1:
+                continue
+            recruiter_name = recruiters_by_user.get(creator_ids[0])
+            if not recruiter_name:
+                continue
+            updates_by_id.setdefault(record["record_id"], {}).update(
+                {
+                    "招募人": recruiter_name,
+                    "招募人账号（系统）": [{"id": creator_ids[0]}],
+                }
+            )
+            owner_repairs["招募人"] += 1
+            creator_attribution_repairs += 1
+
+    formula_managed_date_group = invitation_day_group_is_formula(table_fields)
     group_field = "" if formula_managed_date_group else "邀约日期（按天分组）"
     day_records = (
         []
@@ -1854,6 +1922,7 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bo
         "mode": "dry_run" if dry_run else "apply",
         "records_updated": len(updates),
         "owner_repairs": owner_repairs,
+        "creator_attribution_repairs": creator_attribution_repairs,
         "date_group_repairs": date_group_repairs,
         "date_group_formula_managed": formula_managed_date_group,
         "date_group_changes": date_group_changes,
@@ -2056,6 +2125,10 @@ def ensure_personal_views(fs: Feishu, out_dir: Path) -> dict[str, Any]:
             "招募人账号（系统）",
             "面试官账号（系统）",
             "对接运营账号（系统）",
+            SYSTEM_CREATED_BY_FIELD,
+            SYSTEM_CREATED_AT_FIELD,
+            SYSTEM_MODIFIED_BY_FIELD,
+            SYSTEM_MODIFIED_AT_FIELD,
             "系统：已生成主播档案",
             "自动化批次",
             "系统处理状态",
