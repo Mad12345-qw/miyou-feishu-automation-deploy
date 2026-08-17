@@ -1865,15 +1865,68 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bo
     table_id = TABLES["interview"]
     updates_by_id: dict[str, dict[str, Any]] = {}
     owner_repairs = {name: 0 for name in INTERVIEW_PERSONNEL_DROPDOWNS}
+    account_repairs = {name: 0 for name in INTERVIEW_PERSONNEL_DROPDOWNS}
     creator_attribution_repairs = 0
     modifier_attribution_repairs = 0
     interview_records = fs.list_records(table_id, page_size=500)
+    personnel_records = fs.list_records(TABLES["personnel"], page_size=500)
+    active_people: list[dict[str, Any]] = []
+    for person in personnel_records:
+        fields = person.get("fields") or {}
+        if text_value(fields.get("在职状态")) != "在职" or text_value(fields.get("账号状态")) != "正常":
+            continue
+        name = text_value(fields.get("姓名")).strip()
+        ids = user_ids(fields.get("飞书用户"))
+        if name and ids:
+            active_people.append(
+                {
+                    "name": name,
+                    "department": text_value(fields.get("组织部门")).strip(),
+                    "roles": set(list_value(fields.get("角色"))),
+                    "users": [{"id": user_id} for user_id in ids],
+                }
+            )
+    name_counts: dict[str, int] = {}
+    for person in active_people:
+        name_counts[person["name"]] = name_counts.get(person["name"], 0) + 1
+    for person in active_people:
+        display_name = person["name"]
+        if name_counts[display_name] > 1:
+            display_name = f"{display_name}（{person['department'] or person['users'][0]['id'][-6:]}）"
+        person["display_name"] = display_name
+    dropdown_people: dict[str, dict[str, list[dict[str, str]]]] = {}
+    active_user_to_display: dict[str, dict[str, str]] = {}
+    for visible_name, spec in INTERVIEW_PERSONNEL_DROPDOWNS.items():
+        required_roles = set(spec["roles"])
+        matches = {
+            str(person["display_name"]): person["users"]
+            for person in active_people
+            if not required_roles or set(person["roles"]).intersection(required_roles)
+        }
+        dropdown_people[visible_name] = matches
+        active_user_to_display[visible_name] = {
+            user["id"]: display_name
+            for display_name, users in matches.items()
+            for user in users
+        }
 
     for visible_name, spec in INTERVIEW_PERSONNEL_DROPDOWNS.items():
         account_name = str(spec["account_field"])
         for record in interview_records:
             fields = record.get("fields") or {}
-            if text_value(fields.get(visible_name)).strip() or not user_ids(fields.get(account_name)):
+            selected = text_value(fields.get(visible_name)).strip()
+            existing_ids = user_ids(fields.get(account_name))
+            if selected:
+                users = dropdown_people[visible_name].get(selected)
+                if users and user_ids(users) != existing_ids:
+                    updates_by_id.setdefault(record["record_id"], {})[account_name] = users
+                    account_repairs[visible_name] += 1
+                continue
+            if not existing_ids:
+                continue
+            if len(existing_ids) == 1 and existing_ids[0] in active_user_to_display[visible_name]:
+                updates_by_id.setdefault(record["record_id"], {})[visible_name] = active_user_to_display[visible_name][existing_ids[0]]
+                owner_repairs[visible_name] += 1
                 continue
             names = {
                 str(item.get("name") or item.get("en_name") or "").strip()
@@ -1888,17 +1941,7 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bo
     table_fields = fs.fields(table_id)
     field_names = {str(field.get("field_name") or "") for field in table_fields}
     if SYSTEM_CREATED_BY_FIELD in field_names:
-        recruiters_by_user: dict[str, str] = {}
-        for person in fs.list_records(TABLES["personnel"], page_size=500):
-            fields = person.get("fields") or {}
-            if text_value(fields.get("在职状态")) != "在职" or text_value(fields.get("账号状态")) != "正常":
-                continue
-            if "招募经纪人" not in set(list_value(fields.get("角色"))):
-                continue
-            name = text_value(fields.get("姓名")).strip()
-            for user_id in user_ids(fields.get("飞书用户")):
-                if name:
-                    recruiters_by_user[user_id] = name
+        recruiters_by_user = active_user_to_display["招募人"]
         for record in interview_records:
             fields = record.get("fields") or {}
             if text_value(fields.get("招募人")).strip() or user_ids(fields.get("招募人账号（系统）")):
@@ -1954,6 +1997,7 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bo
         "mode": "dry_run" if dry_run else "apply",
         "records_updated": len(updates),
         "owner_repairs": owner_repairs,
+        "account_repairs": account_repairs,
         "creator_attribution_repairs": creator_attribution_repairs,
         "modifier_attribution_repairs": modifier_attribution_repairs,
         "date_group_repairs": date_group_repairs,
