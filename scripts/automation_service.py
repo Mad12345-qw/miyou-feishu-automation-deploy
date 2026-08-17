@@ -188,10 +188,7 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
         raise RuntimeError("Automation is disabled. Set AUTOMATION_ENABLED=true after cutover approval.")
     if not ANCHOR_TRANSFER_LOCK.acquire(blocking=False):
         return {"skipped": True, "reason": "Anchor transfer sync is already running."}
-    raw_cutover = os.environ.get("AUTOMATION_CUTOVER_MS", "").strip()
     try:
-        if not raw_cutover.isdigit():
-            raise RuntimeError("AUTOMATION_CUTOVER_MS is required before live automation can run.")
         batch = f"LIVE-{datetime.now().strftime('%Y%m%d')}"
         fs = Feishu(tenant_token())
         out_dir = Path("runtime")
@@ -200,7 +197,8 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
             batch,
             limit=max(1, int(os.environ.get("ANCHOR_TRANSFER_BATCH_SIZE", "50"))),
             out_dir=out_dir,
-            not_before_ms=int(raw_cutover),
+            not_before_ms=0,
+            recover_existing_links=True,
         )
         if anchor_maintenance_sync_enabled():
             photos = sync_interview_photos_to_anchors(fs, out_dir)

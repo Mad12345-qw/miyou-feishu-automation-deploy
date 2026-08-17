@@ -140,7 +140,7 @@ def request_json(method: str, url: str, headers: dict[str, str] | None = None, b
                 error_payload = json.loads(text)
             except json.JSONDecodeError:
                 error_payload = {}
-            if error_payload.get("code") == 1254607 and attempt < 4:
+            if (error_payload.get("code") in {1254607, 2200} or exc.code >= 500) and attempt < 4:
                 time.sleep(1 + attempt * 2)
                 continue
             raise RuntimeError(f"{method} {url} failed HTTP {exc.code}: {text}") from exc
@@ -769,7 +769,7 @@ def eligible_interview(record: dict[str, Any], not_before_ms: int = 0) -> bool:
         for record_id in (item.get("record_ids") or [])
         if record_id
     ]
-    if linked_anchors or fields.get("系统：已生成主播档案") is True:
+    if linked_anchors:
         return False
     if fields.get(TRANSFER_TO_ANCHOR_FIELD) is not True and fields.get(LEGACY_TRANSFER_TO_ANCHOR_FIELD) is not True:
         return False
@@ -787,6 +787,25 @@ def linked_record_ids(value: Any) -> list[str]:
         for record_id in (item.get("record_ids") or [])
         if record_id
     ]
+
+
+def find_existing_anchor_for_interview(fs: Feishu, record: dict[str, Any]) -> dict[str, Any] | None:
+    fields = record.get("fields") or {}
+    linked_ids = linked_record_ids(fields.get("关联主播档案"))
+    if linked_ids:
+        return {"record_id": linked_ids[0], "fields": {}}
+    candidate_name = text_value(fields.get("候选人姓名")).strip()
+    if not candidate_name:
+        return None
+    expected_number = f"MYZB-AUTO-{record['record_id'][-10:]}"
+    for anchor in fs.search_records(TABLES["anchor"], ANCHOR_NAME_FIELD, candidate_name, page_size=100):
+        anchor_fields = anchor.get("fields") or {}
+        if (
+            text_value(anchor_fields.get("主播编号")).strip() == expected_number
+            or record["record_id"] in linked_record_ids(anchor_fields.get("来源面试记录"))
+        ):
+            return anchor
+    return None
 
 
 def sync_selected_interview_assignments(fs: Feishu, records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -889,20 +908,15 @@ def build_chain(
     not_before_ms: int = 0,
     recover_existing_links: bool = False,
 ) -> dict[str, Any]:
-    current_transfer = fs.search_records(TABLES["interview"], TRANSFER_TO_ANCHOR_FIELD)
-    legacy_transfer = fs.search_records(TABLES["interview"], LEGACY_TRANSFER_TO_ANCHOR_FIELD)
+    current_transfer = fs.search_records(TABLES["interview"], TRANSFER_TO_ANCHOR_FIELD, page_size=100)
+    legacy_transfer = fs.search_records(TABLES["interview"], LEGACY_TRANSFER_TO_ANCHOR_FIELD, page_size=100)
     interviews_by_id = {record["record_id"]: record for record in [*current_transfer, *legacy_transfer] if record.get("record_id")}
     interviews = list(interviews_by_id.values())
-    anchors_by_source_interview: dict[str, dict[str, Any]] = {}
-    for anchor in fs.list_records(TABLES["anchor"], page_size=500):
-        for interview_id in linked_record_ids((anchor.get("fields") or {}).get("来源面试记录")):
-            anchors_by_source_interview.setdefault(interview_id, anchor)
-
     recovered_updates: list[dict[str, Any]] = []
     skipped_existing_anchors = 0
     selected: list[dict[str, Any]] = []
     for record in interviews:
-        existing_anchor = anchors_by_source_interview.get(record["record_id"])
+        existing_anchor = find_existing_anchor_for_interview(fs, record)
         if existing_anchor:
             fields = record.get("fields") or {}
             if recover_existing_links and (
