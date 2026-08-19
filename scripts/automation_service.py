@@ -17,8 +17,8 @@ from sync_missing_workbench_rows import sync_missing_workbench_rows
 
 
 app = Flask(__name__)
-RECRUITMENT_ENTRY_RECORD_ID = os.environ.get("FEISHU_RECRUITMENT_ENTRY_RECORD_ID", "").strip()
-WORKBENCH_TABLE_ID = os.environ.get("FEISHU_WORKBENCH_TABLE_ID", "").strip()
+RECRUITMENT_ENTRY_RECORD_ID = "rec27KTxtRTDcy"
+WORKBENCH_TABLE_ID = "tblIcblT5703VGvp"
 PERSONNEL_ENTRY_LOCK = threading.Lock()
 ANCHOR_TRANSFER_LOCK = threading.Lock()
 REPORTING_LOCK = threading.Lock()
@@ -55,8 +55,6 @@ def mobile_interview_form_url() -> str:
 
 
 def sync_mobile_form_entry() -> dict[str, object]:
-    if not RECRUITMENT_ENTRY_RECORD_ID or not WORKBENCH_TABLE_ID:
-        raise RuntimeError("FEISHU_RECRUITMENT_ENTRY_RECORD_ID and FEISHU_WORKBENCH_TABLE_ID are required.")
     fs = Feishu(tenant_token())
     response = fs.batch_update(
         WORKBENCH_TABLE_ID,
@@ -386,7 +384,7 @@ def health() -> object:
             "last_personnel_provisioning": last_provisioning,
             "last_anchor_transfer": last_anchor_transfer,
             "anchor_transfer_wake_requested": anchor_transfer_wake_requested,
-            "schema_version": "2026-08-19-dangling-anchor-recovery-v8",
+            "schema_version": "2026-08-19-recovered-child-integrity-v9",
             "active_batch": os.environ.get("AUTOMATION_ACTIVE_BATCH", ""),
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
         }

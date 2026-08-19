@@ -15,29 +15,22 @@ from typing import Any
 
 
 OPENAPI = "https://open.feishu.cn/open-apis"
-APP_TOKEN = os.environ.get("FEISHU_BASE_APP_TOKEN", "").strip()
-WORKBENCH_TABLE = os.environ.get("FEISHU_WORKBENCH_TABLE_ID", "").strip()
+APP_TOKEN = "K3Ckbh4HAat3issjhIhc7NZknBc"
+WORKBENCH_TABLE = "tblIcblT5703VGvp"
 MANAGEMENT_SUMMARY_TABLE_NAME = "09_老板经营看板"
 DEMO_BATCH_PREFIXES = ("ACCEPT-", "客户体验-", "TEST-", "UNIT-", "DEMO-")
 
 TABLES = {
-    "interview": os.environ.get("FEISHU_INTERVIEW_TABLE_ID", "").strip(),
-    "anchor": os.environ.get("FEISHU_ANCHOR_TABLE_ID", "").strip(),
-    "node": os.environ.get("FEISHU_NODE_TABLE_ID", "").strip(),
-    "review": os.environ.get("FEISHU_REVIEW_TABLE_ID", "").strip(),
-    "visual": os.environ.get("FEISHU_VISUAL_TABLE_ID", "").strip(),
-    "training": os.environ.get("FEISHU_TRAINING_TABLE_ID", "").strip(),
-    "task": os.environ.get("FEISHU_TASK_TABLE_ID", "").strip(),
-    "first_live": os.environ.get("FEISHU_FIRST_LIVE_TABLE_ID", "").strip(),
-    "personnel": os.environ.get("FEISHU_PERSONNEL_TABLE_ID", "").strip(),
+    "interview": "tblNuKseW2MGL3EO",
+    "anchor": "tblhYS1AY7Rt2QM2",
+    "node": "tbl7z3Z9wpP62xO9",
+    "review": "tblggoGZKJQKkOyu",
+    "visual": "tblM7pAoDBRo24nC",
+    "training": "tblKs29hTf7pim7g",
+    "task": "tblqIRGhED4gZaJ3",
+    "first_live": "tblsfN165HrNVkKi",
+    "personnel": "tblvNCKFHOPiYtlr",
 }
-FEISHU_BASE_URL = os.environ.get("FEISHU_BASE_URL", "").strip().rstrip("/")
-
-
-def require_base_config() -> None:
-    missing = [name for name, value in {"FEISHU_BASE_APP_TOKEN": APP_TOKEN, "FEISHU_WORKBENCH_TABLE_ID": WORKBENCH_TABLE, "FEISHU_BASE_URL": FEISHU_BASE_URL, **{f"FEISHU_{key.upper()}_TABLE_ID": value for key, value in TABLES.items()}}.items() if not value]
-    if missing:
-        raise RuntimeError(f"Missing Feishu deployment configuration: {', '.join(missing)}")
 
 INTERVIEW_PERSONNEL_DROPDOWNS = {
     "招募人": {
@@ -175,7 +168,6 @@ def get_tenant_token(env_path: Path) -> str:
 
 class Feishu:
     def __init__(self, token: str) -> None:
-        require_base_config()
         self.token = token
 
     def api(self, method: str, path: str, query: dict[str, Any] | None = None, body: Any | None = None) -> dict[str, Any]:
@@ -942,6 +934,276 @@ def anchor_display_name(fields: dict[str, Any]) -> str:
     return nickname or number
 
 
+def build_anchor_child_payloads(
+    anchor: dict[str, Any],
+    interview: dict[str, Any],
+    base_dt: datetime,
+    batch: str,
+) -> dict[str, list[dict[str, Any]]]:
+    anchor_id = str(anchor.get("record_id") or anchor.get("id") or "")
+    anchor_fields = anchor.get("fields") or {}
+    interview_fields = interview.get("fields") or {}
+    anchor_name = text_value(anchor_fields.get(ANCHOR_NAME_FIELD)).strip()
+    anchor_display = anchor_display_name(anchor_fields)
+    owner_users = interview_fields.get("对接运营账号（系统）") or anchor_fields.get("运营经济人") or []
+    owner = (
+        text_value(interview_fields.get("对接运营")).strip()
+        or text_value(owner_users).strip()
+        or text_value(anchor_fields.get("运营经济人")).strip()
+        or "待分配"
+    )
+
+    nodes: list[dict[str, Any]] = []
+    for node_name, hours, note in CHAIN_NODE_TEMPLATE:
+        critical = node_name in {"风格定位", "视觉前置核验", "3分钟录屏考核", "首播复盘"}
+        nodes.append(
+            {
+                "fields": {
+                    ANCHOR_DISPLAY_FIELD: anchor_display,
+                    "关联主播": [anchor_id],
+                    "节点类型": node_name,
+                    "责任人": owner,
+                    "计划完成时间": ms(base_dt + timedelta(hours=hours)),
+                    "节点状态": "未开始",
+                    "是否超时": (base_dt + timedelta(hours=hours)) < datetime.now(),
+                    "SLA小时": hours,
+                    "是否关键准入节点": critical,
+                    "节点验收结果": "待验收",
+                    "备注": f"{anchor_name} - {note}",
+                    "自动化批次": batch,
+                }
+            }
+        )
+
+    tasks: list[dict[str, Any]] = []
+    for task_name, task_type, start_hours, duration_minutes, work in TASK_TEMPLATE:
+        start_dt = base_dt + timedelta(hours=start_hours)
+        tasks.append(
+            {
+                "fields": {
+                    "任务名称": f"{anchor_name} {task_name}",
+                    "任务类型": task_type,
+                    ANCHOR_DISPLAY_FIELD: anchor_display,
+                    "对应主播": [anchor_id],
+                    "负责人": owner,
+                    "运营经济人": owner_users,
+                    "日期": ms(start_dt),
+                    "开始时间": ms(start_dt),
+                    "结束时间": ms(start_dt + timedelta(minutes=duration_minutes)),
+                    "工作事项": work,
+                    "工作状态": "未开始",
+                    "优先级": "高" if task_name in {"首次建联", "首播后复盘"} else "中",
+                    "是否同步飞书日历": False,
+                    "SLA规则": f"面试后{start_hours}小时内",
+                    "自动化批次": batch,
+                }
+            }
+        )
+
+    visual = {
+        "fields": {
+            ANCHOR_DISPLAY_FIELD: anchor_display,
+            "关联主播": [anchor_id],
+            "需求标题": f"{anchor_name} 视觉前置核验与美颜调试",
+            "需求描述": "自动生成：完成视觉前置6项核验后，再进入构图、灯光、美颜参数和试镜视频记录。",
+            "提交运营": owner_users,
+            "预约时间": ms(base_dt + timedelta(hours=30)),
+            "开始时间": ms(base_dt + timedelta(hours=30)),
+            "结束时间": ms(base_dt + timedelta(hours=31)),
+            "紧急程度": "普通",
+            "需求状态": "待接单",
+            "座椅": False,
+            "素颜": False,
+            "背景场地": False,
+            "坐姿镜头": False,
+            "服装": False,
+            "发型": False,
+            "前置核验状态": "未核验",
+            "6项核验是否全部通过": False,
+            "准入结果": "禁止进入培训",
+            "准入异常原因": "视觉前置6项尚未全部确认",
+            "自动化批次": batch,
+        }
+    }
+    training = {
+        "fields": {
+            ANCHOR_DISPLAY_FIELD: anchor_display,
+            "关联主播": [anchor_id],
+            "培训运营": owner_users,
+            "开始时间": ms(base_dt + timedelta(hours=48)),
+            "结束时间": ms(base_dt + timedelta(hours=49)),
+            "账号搭建检查": "未验收",
+            "培训状态": "未开始",
+            "基础话术验收": "未验收",
+            "姿态状态验收": "未验收",
+            "镜头感验收": "未验收",
+            "突发处理验收": "未验收",
+            "转化能力验收": "未验收",
+            "消费力感知验收": "未验收",
+            "录屏审核状态": "待提交",
+            "是否允许进入首播": False,
+            "录屏准入结果": "禁止进入首播",
+            "自动化批次": batch,
+        }
+    }
+    first_live = {
+        "fields": {
+            ANCHOR_DISPLAY_FIELD: anchor_display,
+            "关联主播": [anchor_id],
+            "首播结束时间": ms(base_dt + timedelta(hours=73)),
+            "跟播运营": owner_users,
+            "开始时间": ms(base_dt + timedelta(hours=72)),
+            "结束时间": ms(base_dt + timedelta(hours=73)),
+            "设备检查": "未检查",
+            "网络检查": "未检查",
+            "美颜检查": "未检查",
+            "灯光检查": "未检查",
+            "服装检查": "未检查",
+            "首播状态": "待首播",
+            "是否1小时内复盘": False,
+            "复盘异常原因": "首播复盘尚未完成",
+            "自动化批次": batch,
+        }
+    }
+    return {
+        "node": nodes,
+        "task": tasks,
+        "visual": [visual],
+        "training": [training],
+        "first_live": [first_live],
+    }
+
+
+def ensure_recovered_anchor_children(
+    fs: Feishu,
+    recovered_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
+    batch: str,
+) -> dict[str, Any]:
+    """Fill only missing workflow children for anchors recovered from dangling links."""
+    if not recovered_pairs:
+        return {"checked_anchors": 0, "created": {}, "complete_anchors": 0, "failures": []}
+
+    pairs_by_anchor = {
+        str(anchor.get("record_id") or anchor.get("id") or ""): (anchor, interview)
+        for anchor, interview in recovered_pairs
+        if anchor.get("record_id") or anchor.get("id")
+    }
+    target_ids = set(pairs_by_anchor)
+
+    def linked_children(table_key: str, link_field: str) -> list[dict[str, Any]]:
+        return [
+            record
+            for record in fs.list_records(TABLES[table_key], page_size=500)
+            if target_ids.intersection(linked_record_ids((record.get("fields") or {}).get(link_field)))
+        ]
+
+    existing_nodes = linked_children("node", "关联主播")
+    existing_tasks = linked_children("task", "对应主播")
+    existing_visuals = linked_children("visual", "关联主播")
+    existing_trainings = linked_children("training", "关联主播")
+    existing_first_lives = linked_children("first_live", "关联主播")
+
+    node_keys = {
+        (anchor_id, text_value((record.get("fields") or {}).get("节点类型")).strip())
+        for record in existing_nodes
+        for anchor_id in linked_record_ids((record.get("fields") or {}).get("关联主播"))
+    }
+    task_keys = {
+        (anchor_id, text_value((record.get("fields") or {}).get("任务类型")).strip())
+        for record in existing_tasks
+        for anchor_id in linked_record_ids((record.get("fields") or {}).get("对应主播"))
+    }
+    singleton_ids = {
+        "visual": {anchor_id for record in existing_visuals for anchor_id in linked_record_ids((record.get("fields") or {}).get("关联主播"))},
+        "training": {anchor_id for record in existing_trainings for anchor_id in linked_record_ids((record.get("fields") or {}).get("关联主播"))},
+        "first_live": {anchor_id for record in existing_first_lives for anchor_id in linked_record_ids((record.get("fields") or {}).get("关联主播"))},
+    }
+    missing: dict[str, list[dict[str, Any]]] = {key: [] for key in ("node", "task", "visual", "training", "first_live")}
+    for anchor_id, (anchor, interview) in pairs_by_anchor.items():
+        interview_fields = interview.get("fields") or {}
+        base_dt = parse_feishu_dt(interview_fields.get("面试开始时间") or interview_fields.get("面试时间") or interview_fields.get("邀约时间"))
+        desired = build_anchor_child_payloads(anchor, interview, base_dt, batch)
+        missing["node"].extend(
+            item for item in desired["node"]
+            if (anchor_id, text_value(item["fields"].get("节点类型")).strip()) not in node_keys
+        )
+        missing["task"].extend(
+            item for item in desired["task"]
+            if (anchor_id, text_value(item["fields"].get("任务类型")).strip()) not in task_keys
+        )
+        for table_key in ("visual", "training", "first_live"):
+            if anchor_id not in singleton_ids[table_key]:
+                missing[table_key].extend(desired[table_key])
+
+    create_results = {
+        table_key: fs.batch_create(TABLES[table_key], records, batch_size=500) if records else []
+        for table_key, records in missing.items()
+    }
+
+    final_nodes = linked_children("node", "关联主播")
+    final_tasks = linked_children("task", "对应主播")
+    final_singletons = {
+        "visual": linked_children("visual", "关联主播"),
+        "training": linked_children("training", "关联主播"),
+        "first_live": linked_children("first_live", "关联主播"),
+    }
+    complete_interview_updates: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    per_anchor: dict[str, Any] = {}
+    expected_node_types = {item[0] for item in CHAIN_NODE_TEMPLATE}
+    expected_task_types = {item[1] for item in TASK_TEMPLATE}
+    for anchor_id, (anchor, interview) in pairs_by_anchor.items():
+        node_types = {
+            text_value((record.get("fields") or {}).get("节点类型")).strip()
+            for record in final_nodes
+            if anchor_id in linked_record_ids((record.get("fields") or {}).get("关联主播"))
+        }
+        task_types = {
+            text_value((record.get("fields") or {}).get("任务类型")).strip()
+            for record in final_tasks
+            if anchor_id in linked_record_ids((record.get("fields") or {}).get("对应主播"))
+        }
+        counts = {
+            "nodes": len(node_types.intersection(expected_node_types)),
+            "tasks": len(task_types.intersection(expected_task_types)),
+        }
+        for table_key, records in final_singletons.items():
+            counts[table_key] = sum(
+                1
+                for record in records
+                if anchor_id in linked_record_ids((record.get("fields") or {}).get("关联主播"))
+            )
+        complete = (
+            counts["nodes"] == len(CHAIN_NODE_TEMPLATE)
+            and counts["tasks"] == len(TASK_TEMPLATE)
+            and all(counts[key] >= 1 for key in ("visual", "training", "first_live"))
+        )
+        per_anchor[anchor_id] = {"name": anchor_display_name(anchor.get("fields") or {}), "counts": counts, "complete": complete}
+        if complete:
+            complete_interview_updates.append(
+                {
+                    "record_id": interview["record_id"],
+                    "fields": {
+                        "系统处理状态": "已恢复主播档案并补齐流程",
+                        "系统处理备注": "系统已恢复主播档案关联，并核对补齐全部后续流程记录。",
+                    },
+                }
+            )
+        else:
+            failures.append({"anchor_id": anchor_id, "interview_record_id": interview["record_id"], "counts": counts})
+    completion_results = fs.batch_update(TABLES["interview"], complete_interview_updates, batch_size=100) if complete_interview_updates else []
+    return {
+        "checked_anchors": len(pairs_by_anchor),
+        "requested_creates": {key: len(records) for key, records in missing.items()},
+        "created": {key: len(created_records(results)) for key, results in create_results.items()},
+        "complete_anchors": len(complete_interview_updates),
+        "failures": failures,
+        "per_anchor": per_anchor,
+        "create_results": create_results,
+        "completion_update_results": completion_results,
+    }
+
+
 def sync_anchor_display_names(fs: Feishu, out_dir: Path) -> dict[str, Any]:
     schema_actions: list[dict[str, Any]] = []
     for table_key, spec in ANCHOR_DISPLAY_TABLES.items():
@@ -1009,6 +1271,7 @@ def build_chain(
     }
     recovered_updates: list[dict[str, Any]] = []
     recovered_anchor_updates_by_id: dict[str, dict[str, Any]] = {}
+    recovered_pairs_by_anchor_id: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     dangling_links_replaced: list[dict[str, Any]] = []
     skipped_existing_anchors = 0
     selected: list[dict[str, Any]] = []
@@ -1043,6 +1306,9 @@ def build_chain(
                         "record_id": existing_anchor_id,
                         "fields": {"来源面试记录": [*source_ids, record["record_id"]]},
                     }
+                recovered_pairs_by_anchor_id[existing_anchor_id] = (existing_anchor, record)
+            elif recover_existing_links and text_value(fields.get("系统处理状态")).strip() == "已恢复主播档案关联":
+                recovered_pairs_by_anchor_id[existing_anchor_id] = (existing_anchor, record)
             else:
                 skipped_existing_anchors += 1
             continue
@@ -1068,6 +1334,7 @@ def build_chain(
     ownership_sync = sync_interview_anchor_ownership(fs, interviews)
     assignment_sync = ownership_sync["assignment_sync"]
     anchor_operator_sync = ownership_sync["anchor_operator_sync"]
+    recovered_child_repair = ensure_recovered_anchor_children(fs, list(recovered_pairs_by_anchor_id.values()), batch)
     anchor_records = []
     base_times: list[datetime] = []
     for index, record in enumerate(selected, start=1):
@@ -1118,128 +1385,13 @@ def build_chain(
     first_live_records = []
     interview_updates = []
     for anchor, interview, base_dt in zip(anchors, selected, base_times):
+        child_payloads = build_anchor_child_payloads(anchor, interview, base_dt, batch)
+        node_records.extend(child_payloads["node"])
+        task_records.extend(child_payloads["task"])
+        visual_records.extend(child_payloads["visual"])
+        training_records.extend(child_payloads["training"])
+        first_live_records.extend(child_payloads["first_live"])
         anchor_id = anchor.get("record_id") or anchor.get("id")
-        anchor_fields = anchor.get("fields") or {}
-        anchor_no = text_value(anchor_fields.get("主播编号"))
-        anchor_name = text_value(anchor_fields.get(ANCHOR_NAME_FIELD))
-        anchor_display = anchor_display_name(anchor_fields)
-        owner = text_value(anchor_fields.get("运营经济人")) or "待分配"
-        interview_fields = interview.get("fields") or {}
-        owner_users = interview_fields.get("对接运营账号（系统）") or []
-        for node_name, hours, note in CHAIN_NODE_TEMPLATE:
-            critical = node_name in {"风格定位", "视觉前置核验", "3分钟录屏考核", "首播复盘"}
-            node_records.append(
-                {
-                    "fields": {
-                        ANCHOR_DISPLAY_FIELD: anchor_display,
-                        "关联主播": [anchor_id],
-                        "节点类型": node_name,
-                        "责任人": owner,
-                        "计划完成时间": ms(base_dt + timedelta(hours=hours)),
-                        "节点状态": "未开始",
-                        "是否超时": (base_dt + timedelta(hours=hours)) < datetime.now(),
-                        "SLA小时": hours,
-                        "是否关键准入节点": critical,
-                        "节点验收结果": "待验收",
-                        "备注": f"{anchor_name} - {note}",
-                        "自动化批次": batch,
-                    }
-                }
-            )
-        for task_name, task_type, start_hours, duration_minutes, work in TASK_TEMPLATE:
-            start_dt = base_dt + timedelta(hours=start_hours)
-            task_records.append(
-                {
-                    "fields": {
-                        "任务名称": f"{anchor_name} {task_name}",
-                        "任务类型": task_type,
-                        ANCHOR_DISPLAY_FIELD: anchor_display,
-                        "对应主播": [anchor_id],
-                        "负责人": owner,
-                        "运营经济人": owner_users,
-                        "日期": ms(start_dt),
-                        "开始时间": ms(start_dt),
-                        "结束时间": ms(start_dt + timedelta(minutes=duration_minutes)),
-                        "工作事项": work,
-                        "工作状态": "未开始",
-                        "优先级": "高" if task_name in {"首次建联", "首播后复盘"} else "中",
-                        "是否同步飞书日历": False,
-                        "SLA规则": f"面试后{start_hours}小时内",
-                        "自动化批次": batch,
-                    }
-                }
-            )
-        visual_records.append(
-            {
-                "fields": {
-                    ANCHOR_DISPLAY_FIELD: anchor_display,
-                    "关联主播": [anchor_id],
-                    "需求标题": f"{anchor_name} 视觉前置核验与美颜调试",
-                    "需求描述": "自动生成：完成视觉前置6项核验后，再进入构图、灯光、美颜参数和试镜视频记录。",
-                    "提交运营": owner_users,
-                    "预约时间": ms(base_dt + timedelta(hours=30)),
-                    "开始时间": ms(base_dt + timedelta(hours=30)),
-                    "结束时间": ms(base_dt + timedelta(hours=31)),
-                    "紧急程度": "普通",
-                    "需求状态": "待接单",
-                    "座椅": False,
-                    "素颜": False,
-                    "背景场地": False,
-                    "坐姿镜头": False,
-                    "服装": False,
-                    "发型": False,
-                    "前置核验状态": "未核验",
-                    "6项核验是否全部通过": False,
-                    "准入结果": "禁止进入培训",
-                    "准入异常原因": "视觉前置6项尚未全部确认",
-                    "自动化批次": batch,
-                }
-            }
-        )
-        training_records.append(
-            {
-                "fields": {
-                    ANCHOR_DISPLAY_FIELD: anchor_display,
-                    "关联主播": [anchor_id],
-                    "培训运营": owner_users,
-                    "开始时间": ms(base_dt + timedelta(hours=48)),
-                    "结束时间": ms(base_dt + timedelta(hours=49)),
-                    "账号搭建检查": "未验收",
-                    "培训状态": "未开始",
-                    "基础话术验收": "未验收",
-                    "姿态状态验收": "未验收",
-                    "镜头感验收": "未验收",
-                    "突发处理验收": "未验收",
-                    "转化能力验收": "未验收",
-                    "消费力感知验收": "未验收",
-                    "录屏审核状态": "待提交",
-                    "是否允许进入首播": False,
-                    "录屏准入结果": "禁止进入首播",
-                    "自动化批次": batch,
-                }
-            }
-        )
-        first_live_records.append(
-            {
-                "fields": {
-                    ANCHOR_DISPLAY_FIELD: anchor_display,
-                    "关联主播": [anchor_id],
-                    "首播结束时间": ms(base_dt + timedelta(hours=73)),
-                    "跟播运营": owner_users,
-                    "开始时间": ms(base_dt + timedelta(hours=72)),
-                    "结束时间": ms(base_dt + timedelta(hours=73)),
-                    "设备检查": "未检查",
-                    "网络检查": "未检查",
-                    "美颜检查": "未检查",
-                    "灯光检查": "未检查",
-                    "服装检查": "未检查",
-                    "首播状态": "待首播",
-                    "是否1小时内复盘": False,
-                    "复盘异常原因": "首播复盘尚未完成",
-                    "自动化批次": batch,
-                }
-            }
-        )
         interview_updates.append(
             {
                 "record_id": interview["record_id"],
@@ -1272,6 +1424,7 @@ def build_chain(
         "anchor_operator_sync": anchor_operator_sync,
         "recovered_interview_update_results": recovered_results,
         "recovered_anchor_update_results": recovered_anchor_results,
+        "recovered_child_repair": recovered_child_repair,
         "selected_interviews": len(selected),
         "created_anchors": len(anchors),
         "created_nodes": len(created_records(node_results)),
@@ -2472,7 +2625,7 @@ def sync_personal_workbench_rows(fs: Feishu, out_dir: Path) -> dict[str, Any]:
             if not users:
                 continue
             key = f"个人入口：{name}的{target}"
-            link = f"{FEISHU_BASE_URL}/base/{APP_TOKEN}?table={TABLES[table_key]}&view={view['view_id']}"
+            link = f"https://hxyyb89w4s2.feishu.cn/base/{APP_TOKEN}?table={TABLES[table_key]}&view={view['view_id']}"
             desired[key] = {
                 "我要做什么": key,
                 "谁来操作": role,
@@ -2828,7 +2981,7 @@ def sync_management_summary(fs: Feishu, out_dir: Path) -> dict[str, Any]:
         for record in stale_records
     ]
 
-    link = f"{FEISHU_BASE_URL}/base/{APP_TOKEN}?table={table_id}" + (f"&view={view_id}" if view_id else "")
+    link = f"https://hxyyb89w4s2.feishu.cn/base/{APP_TOKEN}?table={table_id}" + (f"&view={view_id}" if view_id else "")
     workbench_updates = []
     for record in fs.list_records(WORKBENCH_TABLE, page_size=500):
         fields = record.get("fields") or {}
