@@ -805,11 +805,20 @@ def linked_record_ids(value: Any) -> list[str]:
     return record_ids
 
 
-def find_existing_anchor_for_interview(fs: Feishu, record: dict[str, Any]) -> dict[str, Any] | None:
+def find_existing_anchor_for_interview(
+    fs: Feishu,
+    record: dict[str, Any],
+    anchors_by_id: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
     fields = record.get("fields") or {}
     linked_ids = linked_record_ids(fields.get("关联主播档案"))
     if linked_ids:
-        return {"record_id": linked_ids[0], "fields": {}}
+        if anchors_by_id is None:
+            return {"record_id": linked_ids[0], "fields": {}}
+        for linked_id in linked_ids:
+            anchor = anchors_by_id.get(linked_id)
+            if anchor:
+                return anchor
     candidate_name = text_value(fields.get("候选人姓名")).strip()
     if not candidate_name:
         return None
@@ -992,33 +1001,61 @@ def build_chain(
     legacy_transfer = fs.search_records(TABLES["interview"], LEGACY_TRANSFER_TO_ANCHOR_FIELD, page_size=100)
     interviews_by_id = {record["record_id"]: record for record in [*current_transfer, *legacy_transfer] if record.get("record_id")}
     interviews = list(interviews_by_id.values())
+    known_anchors = fs.list_records(TABLES["anchor"], page_size=500)
+    known_anchors_by_id = {
+        str(anchor.get("record_id") or ""): anchor
+        for anchor in known_anchors
+        if anchor.get("record_id")
+    }
     recovered_updates: list[dict[str, Any]] = []
+    recovered_anchor_updates_by_id: dict[str, dict[str, Any]] = {}
+    dangling_links_replaced: list[dict[str, Any]] = []
     skipped_existing_anchors = 0
     selected: list[dict[str, Any]] = []
     for record in interviews:
-        existing_anchor = find_existing_anchor_for_interview(fs, record)
+        fields = record.get("fields") or {}
+        linked_ids = linked_record_ids(fields.get("关联主播档案"))
+        existing_anchor = find_existing_anchor_for_interview(fs, record, known_anchors_by_id)
         if existing_anchor:
-            fields = record.get("fields") or {}
+            existing_anchor_id = str(existing_anchor["record_id"])
+            existing_anchor_fields = existing_anchor.get("fields") or {}
+            source_ids = linked_record_ids(existing_anchor_fields.get("来源面试记录"))
             if recover_existing_links and (
-                not linked_record_ids(fields.get("关联主播档案"))
+                linked_ids != [existing_anchor_id]
                 or fields.get("系统：已生成主播档案") is not True
+                or record["record_id"] not in source_ids
             ):
-                fields["关联主播档案"] = [existing_anchor["record_id"]]
+                fields["关联主播档案"] = [existing_anchor_id]
                 fields["系统：已生成主播档案"] = True
                 recovered_updates.append(
                     {
                         "record_id": record["record_id"],
                         "fields": {
                             "系统：已生成主播档案": True,
-                            "关联主播档案": [existing_anchor["record_id"]],
+                            "关联主播档案": [existing_anchor_id],
                             "系统处理状态": "已恢复主播档案关联",
                             "系统处理备注": "系统检测到已有来源主播档案，已自动恢复面试关联。",
                         },
                     }
                 )
+                if record["record_id"] not in source_ids:
+                    recovered_anchor_updates_by_id[existing_anchor_id] = {
+                        "record_id": existing_anchor_id,
+                        "fields": {"来源面试记录": [*source_ids, record["record_id"]]},
+                    }
             else:
                 skipped_existing_anchors += 1
             continue
+        missing_link_ids = [linked_id for linked_id in linked_ids if linked_id not in known_anchors_by_id]
+        if linked_ids and len(missing_link_ids) == len(linked_ids):
+            fields["关联主播档案"] = []
+            dangling_links_replaced.append(
+                {
+                    "interview_record_id": record["record_id"],
+                    "candidate_name": text_value(fields.get("候选人姓名")).strip(),
+                    "missing_anchor_ids": missing_link_ids,
+                }
+            )
         if not eligible_interview(record, not_before_ms):
             continue
         selected.append(record)
@@ -1026,6 +1063,8 @@ def build_chain(
             break
 
     recovered_results = fs.batch_update(TABLES["interview"], recovered_updates, batch_size=500) if recovered_updates else []
+    recovered_anchor_updates = list(recovered_anchor_updates_by_id.values())
+    recovered_anchor_results = fs.batch_update(TABLES["anchor"], recovered_anchor_updates, batch_size=500) if recovered_anchor_updates else []
     ownership_sync = sync_interview_anchor_ownership(fs, interviews)
     assignment_sync = ownership_sync["assignment_sync"]
     anchor_operator_sync = ownership_sync["anchor_operator_sync"]
@@ -1226,10 +1265,13 @@ def build_chain(
         "not_before_ms": not_before_ms,
         "recovery_mode_enabled": recover_existing_links,
         "recovered_existing_anchors": len(recovered_updates),
+        "recovered_existing_anchor_sources": len(recovered_anchor_updates),
+        "dangling_links_replaced": dangling_links_replaced,
         "skipped_existing_anchors": skipped_existing_anchors,
         "assignment_sync": assignment_sync,
         "anchor_operator_sync": anchor_operator_sync,
         "recovered_interview_update_results": recovered_results,
+        "recovered_anchor_update_results": recovered_anchor_results,
         "selected_interviews": len(selected),
         "created_anchors": len(anchors),
         "created_nodes": len(created_records(node_results)),
