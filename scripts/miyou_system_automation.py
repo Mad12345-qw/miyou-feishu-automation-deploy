@@ -558,6 +558,23 @@ def ensure_fields(fs: Feishu, out_dir: Path) -> dict[str, Any]:
     return report
 
 
+def authoritative_recruiter_view_hidden_fields(
+    fields: dict[str, dict[str, Any]],
+    current_hidden: list[str],
+    system_hidden_names: set[str],
+) -> list[str]:
+    """Show the form-written recruiter account and hide the delayed display copy."""
+    hidden_ids = {str(fields[name]["field_id"]) for name in system_hidden_names if name in fields}
+    recruiter_account_id = str((fields.get("招募人账号（系统）") or {}).get("field_id") or "")
+    recruiter_display_id = str((fields.get("招募人") or {}).get("field_id") or "")
+    desired = list(dict.fromkeys([*current_hidden, *sorted(hidden_ids)]))
+    if recruiter_account_id:
+        desired = [field_id for field_id in desired if field_id != recruiter_account_id]
+    if recruiter_display_id and recruiter_display_id not in desired:
+        desired.append(recruiter_display_id)
+    return desired
+
+
 def ensure_interview_workflow_surface(fs: Feishu, out_dir: Path) -> dict[str, Any]:
     table_id = TABLES["interview"]
     fields = {field.get("field_name"): field for field in fs.fields(table_id)}
@@ -621,7 +638,6 @@ def ensure_interview_workflow_surface(fs: Feishu, out_dir: Path) -> dict[str, An
         "邀约日期",
         LEGACY_TRANSFER_TO_ANCHOR_FIELD,
     }
-    hidden_ids = {fields[name]["field_id"] for name in hidden_names if name in fields}
     user_surface_view_names = {
         "系统全字段（日常不用）",
         "招聘登记与管理",
@@ -646,8 +662,9 @@ def ensure_interview_workflow_surface(fs: Feishu, out_dir: Path) -> dict[str, An
             detail = fs.api("GET", f"/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/views/{view_id}")
             stored = ((detail.get("data") or {}).get("view") or {})
             property_data = stored.get("property") or {}
-            current_hidden = set(property_data.get("hidden_fields") or [])
-            desired_hidden = list(dict.fromkeys([*current_hidden, *sorted(hidden_ids)]))
+            current_hidden_list = list(property_data.get("hidden_fields") or [])
+            current_hidden = set(current_hidden_list)
+            desired_hidden = authoritative_recruiter_view_hidden_fields(fields, current_hidden_list, hidden_names)
             current_name = str(stored.get("view_name") or view.get("view_name") or "")
             desired_name = "招聘登记与管理" if current_name == "系统全字段（日常不用）" else current_name
             if desired_name == current_name and current_hidden == set(desired_hidden):
@@ -1975,6 +1992,8 @@ def sync_interview_personnel_dropdowns(fs: Feishu, out_dir: Path, sync_records: 
             existing_ids = user_ids(fields.get(account_name))
             if selected:
                 users = dropdown_people[visible_name].get(selected)
+                if not users and visible_name == "招募人":
+                    users = self_selected_creator_users(fields, selected)
                 if not users:
                     unresolved[visible_name].add(selected)
                     continue
@@ -2032,6 +2051,21 @@ RECRUITMENT_ATTRIBUTION_FIELDS = (
 
 def has_recruitment_input(fields: dict[str, Any]) -> bool:
     return any(has_meaningful_field_value(fields.get(name)) for name in RECRUITMENT_ATTRIBUTION_FIELDS)
+
+
+def self_selected_creator_users(fields: dict[str, Any], selected_name: str) -> list[dict[str, str]]:
+    """Trust the record creator when a recruiter explicitly selected their own exact name."""
+    selected = selected_name.strip()
+    creators = fields.get(SYSTEM_CREATED_BY_FIELD) or []
+    creator_ids = user_ids(creators)
+    creator_items = creators if isinstance(creators, list) else [creators]
+    creator_names = {
+        str(item.get("name") or item.get("en_name") or "").strip()
+        for item in creator_items if isinstance(item, dict)
+    }
+    if has_recruitment_input(fields) and selected and len(creator_ids) == 1 and creator_names == {selected}:
+        return [{"id": creator_ids[0]}]
+    return []
 
 
 def safe_to_attribute_recruiter_from_modifier(fields: dict[str, Any]) -> bool:
@@ -2113,6 +2147,8 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bo
             existing_ids = user_ids(fields.get(account_name))
             if selected:
                 users = dropdown_people[visible_name].get(selected)
+                if not users and visible_name == "招募人":
+                    users = self_selected_creator_users(fields, selected)
                 if users and user_ids(users) != existing_ids:
                     updates_by_id.setdefault(record["record_id"], {})[account_name] = users
                     account_repairs[visible_name] += 1
@@ -2257,6 +2293,8 @@ def sync_one_interview_personnel_assignment(fs: Feishu, record_id: str, out_dir:
                 changed[visible_name] = display_by_user_id[existing_ids[0]]
             continue
         users = people_by_name.get(selected)
+        if not users and visible_name == "招募人":
+            users = self_selected_creator_users(fields, selected)
         if not users:
             unresolved.append(selected)
             continue
@@ -2427,7 +2465,7 @@ def ensure_personal_views(fs: Feishu, out_dir: Path) -> dict[str, Any]:
     interview_hidden_fields = [
         field_ids_by_table["interview"].get(name)
         for name in [
-            "招募人账号（系统）",
+            "招募人",
             "面试官账号（系统）",
             "对接运营账号（系统）",
             SYSTEM_CREATED_BY_FIELD,
