@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import threading
 import time
 import urllib.parse
@@ -26,9 +27,14 @@ INTERVIEW_INTEGRITY_LOCK = threading.Lock()
 FEISHU_EVENT_LOCK = threading.Lock()
 PROVISIONING_STATE_LOCK = threading.Lock()
 ANCHOR_TRANSFER_STATE_LOCK = threading.Lock()
+FEISHU_LONG_CONNECTION_STATE_LOCK = threading.Lock()
+FEISHU_RECORD_QUEUE: queue.Queue[tuple[str, str, str]] = queue.Queue()
+FEISHU_PENDING_RECORDS: set[tuple[str, str]] = set()
+FEISHU_PENDING_RECORDS_LOCK = threading.Lock()
 LAST_FEISHU_RECORD_EVENT: dict[str, object] = {"received": False}
 LAST_PERSONNEL_PROVISIONING: dict[str, object] = {"status": "not_run"}
 LAST_ANCHOR_TRANSFER: dict[str, object] = {"status": "not_run"}
+FEISHU_LONG_CONNECTION_STATE: dict[str, object] = {"status": "disabled"}
 
 
 def tenant_token() -> str:
@@ -52,6 +58,13 @@ def mobile_interview_form_url() -> str:
         raise RuntimeError("PUBLIC_SERVICE_URL and MOBILE_FORM_TOKEN are required.")
     query = urllib.parse.urlencode({"token": form_token})
     return f"{public_url}/forms/interview?{query}"
+
+
+def mobile_form_configured() -> bool:
+    return bool(
+        os.environ.get("PUBLIC_SERVICE_URL", "").strip()
+        and os.environ.get("MOBILE_FORM_TOKEN", "").strip()
+    )
 
 
 def sync_mobile_form_entry() -> dict[str, object]:
@@ -328,12 +341,13 @@ def background_scheduler() -> None:
     # a user to re-enter the same assignment in a second table.
     base_interval = max(60, int(os.environ.get("AUTOMATION_INTERVAL_SECONDS", "60")))
     workers = [
-        ("Mobile form entry sync", base_interval, lambda: True, sync_mobile_form_entry),
         ("Interview integrity sync", base_interval, personnel_dropdown_sync_enabled, run_interview_integrity_cycle),
         ("Personnel entry sync", max(60, min(base_interval, 180)), personnel_dropdown_sync_enabled, run_personnel_entry_cycle),
         ("Anchor transfer sync", max(60, min(base_interval, 180)), service_enabled, run_anchor_transfer_cycle),
         ("Reporting sync", max(300, base_interval * 3), lambda: service_enabled() and reporting_sync_enabled(), run_reporting_cycle),
     ]
+    if mobile_form_configured():
+        workers.insert(0, ("Mobile form entry sync", base_interval, lambda: True, sync_mobile_form_entry))
     for name, interval, enabled, action in workers:
         threading.Thread(target=worker, args=(name, interval, enabled, action), daemon=True, name=name).start()
     while True:
@@ -352,6 +366,125 @@ def note_feishu_record_event(event_type: str, table_kind: str) -> None:
         )
 
 
+def enqueue_feishu_record_changes(
+    event_type: str,
+    file_token: str,
+    table_id: str,
+    record_ids: list[str],
+    transport: str,
+) -> dict[str, object]:
+    """Queue changed interview rows so the event receiver can acknowledge immediately."""
+    if file_token != APP_TOKEN:
+        return {"queued": 0, "ignored": "other_app"}
+    if table_id != TABLES["interview"]:
+        note_feishu_record_event(event_type, "ignored")
+        return {"queued": 0, "ignored": "other_table"}
+
+    note_feishu_record_event(event_type, "interview")
+    queued = 0
+    for record_id in dict.fromkeys(str(value or "").strip() for value in record_ids):
+        if not record_id:
+            continue
+        key = (table_id, record_id)
+        with FEISHU_PENDING_RECORDS_LOCK:
+            if key in FEISHU_PENDING_RECORDS:
+                continue
+            FEISHU_PENDING_RECORDS.add(key)
+        FEISHU_RECORD_QUEUE.put((table_id, record_id, transport))
+        queued += 1
+    return {"queued": queued, "transport": transport}
+
+
+def handle_long_connection_record_event(data: object) -> dict[str, object]:
+    event = getattr(data, "event", None)
+    header = getattr(data, "header", None)
+    actions = getattr(event, "action_list", None) or []
+    record_ids = [
+        str(getattr(action, "record_id", "") or "")
+        for action in actions
+        if "delete" not in str(getattr(action, "action", "") or "").lower()
+    ]
+    return enqueue_feishu_record_changes(
+        str(getattr(header, "event_type", "") or "drive.file.bitable_record_changed_v1"),
+        str(getattr(event, "file_token", "") or ""),
+        str(getattr(event, "table_id", "") or ""),
+        record_ids,
+        "long_connection",
+    )
+
+
+def feishu_record_worker() -> None:
+    while True:
+        table_id, record_id, transport = FEISHU_RECORD_QUEUE.get()
+        try:
+            fs = Feishu(tenant_token())
+            result = sync_one_interview_personnel_assignment(fs, record_id, Path("runtime"))
+            app.logger.info(
+                "Processed Feishu interview event via %s for %s: %s",
+                transport,
+                record_id,
+                result.get("updated_fields", {}),
+            )
+            trigger_anchor_transfer_async(f"Feishu interview event via {transport}")
+        except Exception as exc:
+            app.logger.exception("Feishu record event processing failed for %s: %s", record_id, exc)
+        finally:
+            with FEISHU_PENDING_RECORDS_LOCK:
+                FEISHU_PENDING_RECORDS.discard((table_id, record_id))
+            FEISHU_RECORD_QUEUE.task_done()
+
+
+def feishu_long_connection_enabled() -> bool:
+    return os.environ.get("FEISHU_LONG_CONNECTION_ENABLED", "false").lower() == "true"
+
+
+def run_feishu_long_connection() -> None:
+    import lark_oapi as lark
+
+    while True:
+        try:
+            with FEISHU_LONG_CONNECTION_STATE_LOCK:
+                FEISHU_LONG_CONNECTION_STATE.update(
+                    {
+                        "status": "starting",
+                        "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "error": "",
+                    }
+                )
+            event_handler = (
+                lark.EventDispatcherHandler.builder("", "")
+                .register_p2_drive_file_bitable_record_changed_v1(handle_long_connection_record_event)
+                .build()
+            )
+            client = lark.ws.Client(
+                os.environ["FEISHU_APP_ID"],
+                os.environ["FEISHU_APP_SECRET"],
+                event_handler=event_handler,
+                log_level=lark.LogLevel.INFO,
+                auto_reconnect=True,
+            )
+            with FEISHU_LONG_CONNECTION_STATE_LOCK:
+                FEISHU_LONG_CONNECTION_STATE.update(
+                    {
+                        "status": "running",
+                        "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "error": "",
+                    }
+                )
+            client.start()
+        except Exception as exc:
+            with FEISHU_LONG_CONNECTION_STATE_LOCK:
+                FEISHU_LONG_CONNECTION_STATE.update(
+                    {
+                        "status": "failed",
+                        "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "error": str(exc),
+                    }
+                )
+            app.logger.exception("Feishu long connection failed: %s", exc)
+            time.sleep(15)
+
+
 @app.get("/health")
 def health() -> object:
     with FEISHU_EVENT_LOCK:
@@ -360,6 +493,8 @@ def health() -> object:
         last_provisioning = dict(LAST_PERSONNEL_PROVISIONING)
     with ANCHOR_TRANSFER_STATE_LOCK:
         last_anchor_transfer = dict(LAST_ANCHOR_TRANSFER)
+    with FEISHU_LONG_CONNECTION_STATE_LOCK:
+        long_connection = dict(FEISHU_LONG_CONNECTION_STATE)
     anchor_transfer_wake_requested = False
     if last_anchor_transfer.get("status") in {"not_run", "failed"}:
         anchor_transfer_wake_requested = trigger_anchor_transfer_async("health wake")
@@ -375,16 +510,16 @@ def health() -> object:
             "interview_owner_and_date_group_repair_enabled": personnel_dropdown_sync_enabled(),
             "reporting_sync_enabled": reporting_sync_enabled(),
             "anchor_maintenance_sync_enabled": anchor_maintenance_sync_enabled(),
-            "mobile_form_configured": bool(
-                os.environ.get("PUBLIC_SERVICE_URL", "").strip()
-                and os.environ.get("MOBILE_FORM_TOKEN", "").strip()
-            ),
+            "mobile_form_configured": mobile_form_configured(),
+            "feishu_long_connection_enabled": feishu_long_connection_enabled(),
+            "feishu_long_connection": long_connection,
+            "feishu_record_event_queue_size": FEISHU_RECORD_QUEUE.qsize(),
             "feishu_record_event_callback_ready": True,
             "last_feishu_record_event": last_event,
             "last_personnel_provisioning": last_provisioning,
             "last_anchor_transfer": last_anchor_transfer,
             "anchor_transfer_wake_requested": anchor_transfer_wake_requested,
-            "schema_version": "2026-08-21-direct-recruiter-account-view-v10",
+            "schema_version": "2026-08-22-single-server-long-connection-v11",
             "active_batch": os.environ.get("AUTOMATION_ACTIVE_BATCH", ""),
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
@@ -393,35 +528,25 @@ def health() -> object:
 
 @app.post("/webhook/feishu")
 def feishu_record_event() -> object:
-    """Process a changed Base row immediately; repeated delivery is harmless."""
+    """Retain Webhook compatibility during cutover while work runs asynchronously."""
     payload = request.get_json(silent=True) or {}
     if payload.get("type") == "url_verification":
         return jsonify({"challenge": payload.get("challenge", "")})
 
     header = payload.get("header") or {}
     event = payload.get("event") or {}
-    if str(event.get("app_token") or "") != APP_TOKEN:
-        return jsonify({"ok": True, "ignored": "other_app"})
     table_id = str(event.get("table_id") or "")
     record_id = str(event.get("record_id") or "")
     if not record_id:
         return jsonify({"ok": True, "ignored": "missing_record"})
-    fs = Feishu(tenant_token())
-    out_dir = Path("runtime")
-    if table_id == TABLES["interview"]:
-        note_feishu_record_event(str(header.get("event_type") or ""), "interview")
-        result = sync_one_interview_personnel_assignment(fs, record_id, out_dir)
-        transfer_wake_requested = trigger_anchor_transfer_async("Feishu interview event")
-        return jsonify(
-            {
-                "ok": True,
-                "kind": "interview_assignment",
-                "updated_fields": result["updated_fields"],
-                "anchor_transfer_wake_requested": transfer_wake_requested,
-            }
-        )
-    note_feishu_record_event(str(header.get("event_type") or ""), "ignored")
-    return jsonify({"ok": True, "ignored": "other_table", "event_type": header.get("event_type", "")})
+    result = enqueue_feishu_record_changes(
+        str(header.get("event_type") or ""),
+        str(event.get("app_token") or event.get("file_token") or ""),
+        table_id,
+        [record_id],
+        "webhook",
+    )
+    return jsonify({"ok": True, **result})
 
 
 @app.post("/jobs/reconcile")
@@ -545,6 +670,9 @@ def anchor_transfers_job() -> object:
 
 
 if __name__ == "__main__":
+    threading.Thread(target=feishu_record_worker, daemon=True, name="Feishu record worker").start()
     if os.environ.get("LOCAL_SCHEDULER_ENABLED", "false").lower() == "true":
         threading.Thread(target=background_scheduler, daemon=True).start()
+    if feishu_long_connection_enabled():
+        threading.Thread(target=run_feishu_long_connection, daemon=True, name="Feishu long connection").start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
