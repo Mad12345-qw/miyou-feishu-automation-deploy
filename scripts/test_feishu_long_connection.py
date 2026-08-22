@@ -19,6 +19,28 @@ import automation_service as service
 
 
 class FeishuLongConnectionTests(unittest.TestCase):
+    def test_subscription_is_created_and_verified(self) -> None:
+        class FakeFeishu:
+            def __init__(self, token: str) -> None:
+                self.token = token
+                self.calls: list[tuple[str, str, dict[str, str]]] = []
+
+            def api(self, method: str, path: str, query: dict[str, str]) -> dict[str, object]:
+                self.calls.append((method, path, query))
+                if method == "GET":
+                    return {"code": 0, "data": {"is_subscribe": True}}
+                return {"code": 0, "msg": "Success"}
+
+        fake = FakeFeishu("tenant-token")
+        with (
+            patch.object(service, "tenant_token", return_value="tenant-token"),
+            patch.object(service, "Feishu", return_value=fake),
+        ):
+            result = service.ensure_bitable_event_subscription()
+
+        self.assertEqual({"subscribed": True}, result)
+        self.assertEqual(["POST", "GET"], [call[0] for call in fake.calls])
+
     def test_long_connection_event_queues_non_deleted_interview_records(self) -> None:
         data = SimpleNamespace(
             header=SimpleNamespace(event_type="drive.file.bitable_record_changed_v1"),

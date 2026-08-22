@@ -444,6 +444,26 @@ def feishu_long_connection_enabled() -> bool:
     return os.environ.get("FEISHU_LONG_CONNECTION_ENABLED", "false").lower() == "true"
 
 
+def ensure_bitable_event_subscription() -> dict[str, object]:
+    fs = Feishu(tenant_token())
+    subscribe = fs.api(
+        "POST",
+        f"/drive/v1/files/{APP_TOKEN}/subscribe",
+        {"file_type": "bitable"},
+    )
+    if subscribe.get("code") != 0:
+        raise RuntimeError(f"Unable to subscribe to Base record events: {subscribe}")
+    status = fs.api(
+        "GET",
+        f"/drive/v1/files/{APP_TOKEN}/get_subscribe",
+        {"file_type": "bitable"},
+    )
+    subscribed = bool((status.get("data") or {}).get("is_subscribe"))
+    if status.get("code") != 0 or not subscribed:
+        raise RuntimeError(f"Base record event subscription is not active: {status}")
+    return {"subscribed": True}
+
+
 def run_feishu_long_connection() -> None:
     import lark_oapi as lark
 
@@ -457,6 +477,7 @@ def run_feishu_long_connection() -> None:
                         "error": "",
                     }
                 )
+            subscription = ensure_bitable_event_subscription()
             event_handler = (
                 lark.EventDispatcherHandler.builder("", "")
                 .register_p2_drive_file_bitable_record_changed_v1(handle_long_connection_record_event)
@@ -473,6 +494,7 @@ def run_feishu_long_connection() -> None:
                 FEISHU_LONG_CONNECTION_STATE.update(
                     {
                         "status": "running",
+                        "subscription_confirmed": subscription["subscribed"],
                         "time": datetime.now().astimezone().isoformat(timespec="seconds"),
                         "error": "",
                     }
