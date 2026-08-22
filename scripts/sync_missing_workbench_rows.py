@@ -95,7 +95,7 @@ def sync_missing_workbench_rows(fs: Feishu, out_dir: Path, dry_run: bool = False
     ]
     creates: list[dict[str, Any]] = []
     updates: list[dict[str, Any]] = []
-    stale_record_ids: list[str] = []
+    stale_records: list[dict[str, Any]] = []
     unchanged: list[str] = []
     for key, records in existing_by_key.items():
         if key in desired:
@@ -103,11 +103,11 @@ def sync_missing_workbench_rows(fs: Feishu, out_dir: Path, dry_run: bool = False
         for record in records:
             fields = record.get("fields") or {}
             if (
-                text_value(fields.get("谁来操作")) == "本人"
-                and text_value(fields.get("系统自动")) == "系统按飞书人员账号自动筛选本人记录"
+                text_value(fields.get("系统自动")) == "系统按飞书人员账号自动筛选本人记录"
                 and record.get("record_id")
             ):
-                stale_record_ids.append(str(record["record_id"]))
+                stale_records.append(record)
+    stale_record_ids = [str(record["record_id"]) for record in stale_records]
     for key, fields in desired.items():
         records = existing_by_key.get(key) or []
         if not records:
@@ -154,6 +154,7 @@ def sync_missing_workbench_rows(fs: Feishu, out_dir: Path, dry_run: bool = False
         "create_results": create_results,
         "update_results": update_results,
         "delete_results": delete_results,
+        "hidden_snapshot": stale_records,
     }
     write_json(out_dir / "sync_missing_workbench_rows_result.json", report)
     return report

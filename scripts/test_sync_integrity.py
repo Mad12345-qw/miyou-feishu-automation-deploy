@@ -306,7 +306,7 @@ class SyncIntegrityTests(unittest.TestCase):
                             "record_id": "rec_stale",
                             "fields": {
                                 "我要做什么": "个人入口：离职员工的候选人",
-                                "谁来操作": "本人",
+                                "谁来操作": "招募经纪人",
                                 "系统自动": "系统按飞书人员账号自动筛选本人记录",
                                 "员工账号": [{"id": "ou_inactive"}],
                             },
