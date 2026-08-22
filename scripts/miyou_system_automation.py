@@ -358,6 +358,20 @@ class Feishu:
                 break
         return results
 
+    def batch_delete(self, table_id: str, record_ids: list[str], batch_size: int = 500) -> list[dict[str, Any]]:
+        results = []
+        for start in range(0, len(record_ids), batch_size):
+            batch = record_ids[start : start + batch_size]
+            data = self.api(
+                "POST",
+                f"/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/records/batch_delete",
+                body={"records": batch},
+            )
+            results.append(data)
+            if data.get("code") != 0:
+                break
+        return results
+
 
 def ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)

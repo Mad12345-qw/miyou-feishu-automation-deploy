@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 import sync_missing_personal_entries as personal
 import sync_missing_workbench_rows as workbench
-from miyou_system_automation import TABLES, contact_api_with_retry, find_existing_anchor_for_interview, load_env, personnel_fields_changed, request_json, sync_selected_interview_assignments
+from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, find_existing_anchor_for_interview, load_env, personnel_fields_changed, request_json, sync_selected_interview_assignments
 from repair_live_data_integrity import CHILD_SPECS, plan_duplicate_child_cleanup
 
 
@@ -99,6 +99,21 @@ class FakeFeishu:
 
 
 class SyncIntegrityTests(unittest.TestCase):
+    def test_batch_delete_uses_feishu_batch_endpoint(self) -> None:
+        fs = Feishu("token")
+        calls = []
+
+        def api(method, path, query=None, body=None):
+            calls.append((method, path, body))
+            return {"code": 0}
+
+        fs.api = api
+        results = fs.batch_delete("tbl_test", ["rec_a", "rec_b", "rec_c"], batch_size=2)
+
+        self.assertEqual(2, len(results))
+        self.assertEqual({"records": ["rec_a", "rec_b"]}, calls[0][2])
+        self.assertTrue(calls[0][1].endswith("/records/batch_delete"))
+
     def test_pristine_duplicate_children_keep_the_assigned_newer_row(self) -> None:
         records = {key: [] for key in CHILD_SPECS}
         records["task"] = [

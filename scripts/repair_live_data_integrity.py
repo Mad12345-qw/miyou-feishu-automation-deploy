@@ -11,7 +11,6 @@ from typing import Any
 from miyou_system_automation import (
     ANCHOR_DISPLAY_FIELD,
     ANCHOR_NAME_FIELD,
-    APP_TOKEN,
     TABLES,
     Feishu,
     anchor_display_name,
@@ -367,12 +366,10 @@ def apply_plan(fs: Feishu, plan: dict[str, Any], out_dir: Path) -> dict[str, Any
 
     delete_results: dict[str, list[dict[str, Any]]] = {}
     for table_key in [*CHILD_SPECS, "anchor"]:
-        results = []
-        for record_id in plan["deletes"].get(table_key, []):
-            response = fs.api("DELETE", f"/bitable/v1/apps/{APP_TOKEN}/tables/{TABLES[table_key]}/records/{record_id}")
-            if response.get("code") != 0:
-                raise RuntimeError(f"Delete failed for {table_key}/{record_id}: {response}")
-            results.append(response)
+        record_ids = plan["deletes"].get(table_key, [])
+        results = fs.batch_delete(TABLES[table_key], record_ids, batch_size=500) if record_ids else []
+        if any(result.get("code") != 0 for result in results):
+            raise RuntimeError(f"Batch delete failed for {table_key}: {results}")
         delete_results[table_key] = results
 
     current = load_records(fs)
@@ -393,7 +390,8 @@ def apply_plan(fs: Feishu, plan: dict[str, Any], out_dir: Path) -> dict[str, Any
     assignment_sync = sync_missing_interview_display_fields(fs, out_dir)
     return {
         "update_results": update_results,
-        "delete_counts": {key: len(value) for key, value in delete_results.items()},
+        "delete_counts": {key: len(plan["deletes"].get(key, [])) for key in delete_results},
+        "delete_batches": {key: len(value) for key, value in delete_results.items()},
         "child_repair": child_repair,
         "display_sync": display_sync,
         "assignment_sync": assignment_sync,
