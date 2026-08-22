@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import sync_missing_personal_entries as personal
 import sync_missing_workbench_rows as workbench
-from miyou_system_automation import TABLES, contact_api_with_retry, find_existing_anchor_for_interview, personnel_fields_changed, sync_selected_interview_assignments
+from miyou_system_automation import TABLES, contact_api_with_retry, find_existing_anchor_for_interview, load_env, personnel_fields_changed, sync_selected_interview_assignments
 
 
 USER_ID = "ou_correct_user"
@@ -96,6 +96,12 @@ class FakeFeishu:
 
 
 class SyncIntegrityTests(unittest.TestCase):
+    def test_env_loader_removes_systemd_style_quotes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "service.env"
+            path.write_text('FEISHU_APP_ID="cli_test"\nFEISHU_APP_SECRET=plain\n', encoding="utf-8")
+            self.assertEqual({"FEISHU_APP_ID": "cli_test", "FEISHU_APP_SECRET": "plain"}, load_env(path))
+
     def test_rich_manual_anchor_wins_over_generated_skeleton(self) -> None:
         interview = {"record_id": "rec_interview", "fields": {"候选人姓名": "主播甲", "关联主播档案": ["rec_auto"]}}
         anchors = {
