@@ -22,6 +22,7 @@ class FakeFeishu:
     def __init__(self) -> None:
         self.patches = []
         self.updates = []
+        self.deletes = []
 
     def fields(self, table_id: str):
         if table_id == personal.TABLES["interview"]:
@@ -96,6 +97,10 @@ class FakeFeishu:
     def batch_update(self, table_id: str, records, batch_size: int = 500):
         self.updates.extend(records)
         return [{"code": 0, "data": {"records": records}}]
+
+    def batch_delete(self, table_id: str, record_ids, batch_size: int = 500):
+        self.deletes.extend(record_ids)
+        return [{"code": 0, "data": {"records": record_ids}}]
 
 
 class SyncIntegrityTests(unittest.TestCase):
@@ -290,6 +295,42 @@ class SyncIntegrityTests(unittest.TestCase):
         self.assertEqual(1, report["repaired"])
         self.assertEqual([USER_ID], workbench.user_ids(fs.updates[0]["fields"]["员工账号"]))
         self.assertIn(f"view={VIEW_ID}", fs.updates[0]["fields"]["点这里办理"]["link"])
+
+    def test_stale_system_generated_workbench_rows_are_hidden(self) -> None:
+        class StaleRowFeishu(FakeFeishu):
+            def list_records(self, table_id: str, page_size: int = 500):
+                records = super().list_records(table_id, page_size)
+                if table_id == workbench.WORKBENCH_TABLE:
+                    records.append(
+                        {
+                            "record_id": "rec_stale",
+                            "fields": {
+                                "我要做什么": "个人入口：离职员工的候选人",
+                                "谁来操作": "本人",
+                                "系统自动": "系统按飞书人员账号自动筛选本人记录",
+                                "员工账号": [{"id": "ou_inactive"}],
+                            },
+                        }
+                    )
+                return records
+
+        fs = StaleRowFeishu()
+        spec = ("interview", "招募人账号（系统）", "招聘", "候选人", {"招募经纪人"}, "候选人", "打开我的候选人")
+        original_api = fs.api
+
+        def correct_view_api(method: str, path: str, query=None, body=None):
+            response = original_api(method, path, query, body)
+            if method == "GET" and path.endswith(f"/views/{VIEW_ID}"):
+                response["data"]["view"]["property"]["filter_info"]["conditions"][0]["value"] = f'["{USER_ID}"]'
+            return response
+
+        fs.api = correct_view_api
+        with TemporaryDirectory() as tmp, patch.object(workbench, "SPECS", [spec]):
+            report = workbench.sync_missing_workbench_rows(fs, Path(tmp))
+
+        self.assertEqual(1, report["planned_hidden"])
+        self.assertEqual(1, report["hidden"])
+        self.assertEqual(["rec_stale"], fs.deletes)
 
 
 if __name__ == "__main__":

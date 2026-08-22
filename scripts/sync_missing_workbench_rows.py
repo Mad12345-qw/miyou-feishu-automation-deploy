@@ -95,7 +95,19 @@ def sync_missing_workbench_rows(fs: Feishu, out_dir: Path, dry_run: bool = False
     ]
     creates: list[dict[str, Any]] = []
     updates: list[dict[str, Any]] = []
+    stale_record_ids: list[str] = []
     unchanged: list[str] = []
+    for key, records in existing_by_key.items():
+        if key in desired:
+            continue
+        for record in records:
+            fields = record.get("fields") or {}
+            if (
+                text_value(fields.get("谁来操作")) == "本人"
+                and text_value(fields.get("系统自动")) == "系统按飞书人员账号自动筛选本人记录"
+                and record.get("record_id")
+            ):
+                stale_record_ids.append(str(record["record_id"]))
     for key, fields in desired.items():
         records = existing_by_key.get(key) or []
         if not records:
@@ -121,15 +133,18 @@ def sync_missing_workbench_rows(fs: Feishu, out_dir: Path, dry_run: bool = False
 
     create_results = [] if dry_run or not creates else fs.batch_create(WORKBENCH_TABLE, creates, batch_size=500)
     update_results = [] if dry_run or not updates else fs.batch_update(WORKBENCH_TABLE, updates, batch_size=500)
-    failed = [result for result in [*create_results, *update_results] if result.get("code") != 0]
+    delete_results = [] if dry_run or not stale_record_ids else fs.batch_delete(WORKBENCH_TABLE, stale_record_ids, batch_size=500)
+    failed = [result for result in [*create_results, *update_results, *delete_results] if result.get("code") != 0]
     report = {
         "mode": "dry_run" if dry_run else "apply",
         "people": len(people),
         "desired_rows": len(desired),
         "planned_created": len(creates),
         "planned_repaired": len(updates),
+        "planned_hidden": len(stale_record_ids),
         "created": 0 if dry_run else sum(len(((result.get("data") or {}).get("records") or [])) for result in create_results if result.get("code") == 0),
         "repaired": 0 if dry_run else sum(len(((result.get("data") or {}).get("records") or [])) for result in update_results if result.get("code") == 0),
+        "hidden": 0 if dry_run else (len(stale_record_ids) if delete_results and all(result.get("code") == 0 for result in delete_results) else 0),
         "unchanged": len(unchanged),
         "missing_views": missing_views,
         "conflicts": conflicts,
@@ -138,6 +153,7 @@ def sync_missing_workbench_rows(fs: Feishu, out_dir: Path, dry_run: bool = False
         "failed": failed,
         "create_results": create_results,
         "update_results": update_results,
+        "delete_results": delete_results,
     }
     write_json(out_dir / "sync_missing_workbench_rows_result.json", report)
     return report
