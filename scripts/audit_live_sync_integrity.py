@@ -13,7 +13,9 @@ from typing import Any
 from miyou_system_automation import (
     ANCHOR_NAME_FIELD,
     APP_TOKEN,
+    CHAIN_NODE_TEMPLATE,
     TABLES,
+    TASK_TEMPLATE,
     WORKBENCH_TABLE,
     Feishu,
     get_tenant_token,
@@ -337,13 +339,34 @@ def audit(fs: Feishu, recent_days: int) -> dict[str, Any]:
                     issue("children", "duplicate_child_business_key", table=table_key, anchor_id=anchor_id, field=unique_field, duplicate_values=duplicates)
         child_by_anchor[table_key] = mapped
 
+    expected_node_types = {item[0] for item in CHAIN_NODE_TEMPLATE}
+    expected_task_types = {item[1] for item in TASK_TEMPLATE}
     for interview_id, anchor in canonical_anchor_by_interview.items():
         anchor_id = str(anchor.get("record_id") or "")
         candidate = text_value((checked_interviews[interview_id].get("fields") or {}).get("候选人姓名")).strip()
         for table_key, (_link_field, expected_count, _unique_field) in CHILD_SPECS.items():
-            actual_count = len(child_by_anchor[table_key].get(anchor_id) or [])
-            if actual_count != expected_count:
-                issue("children", "generated_anchor_child_count_mismatch", interview_record_id=interview_id, anchor_record_id=anchor_id, candidate=candidate, table=table_key, expected=expected_count, actual=actual_count)
+            anchor_rows = child_by_anchor[table_key].get(anchor_id) or []
+            if table_key == "node":
+                actual_keys = {text_value((row.get("fields") or {}).get("节点类型")).strip() for row in anchor_rows}
+                missing_keys = sorted(expected_node_types - actual_keys)
+            elif table_key == "task":
+                actual_keys = {text_value((row.get("fields") or {}).get("任务类型")).strip() for row in anchor_rows}
+                missing_keys = sorted(expected_task_types - actual_keys)
+            else:
+                actual_keys = set()
+                missing_keys = [table_key] if not anchor_rows else []
+            if missing_keys:
+                issue(
+                    "children",
+                    "generated_anchor_child_count_mismatch",
+                    interview_record_id=interview_id,
+                    anchor_record_id=anchor_id,
+                    candidate=candidate,
+                    table=table_key,
+                    expected=expected_count,
+                    actual=len(anchor_rows),
+                    missing_keys=missing_keys,
+                )
 
     issue_counts = Counter(f"{item['area']}:{item['code']}" for item in issues)
     warning_counts = Counter(f"{item['area']}:{item['code']}" for item in warnings)

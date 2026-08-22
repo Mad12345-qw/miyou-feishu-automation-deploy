@@ -11,7 +11,9 @@ from typing import Any
 from miyou_system_automation import (
     ANCHOR_DISPLAY_FIELD,
     ANCHOR_NAME_FIELD,
+    CHAIN_NODE_TEMPLATE,
     TABLES,
+    TASK_TEMPLATE,
     Feishu,
     anchor_display_name,
     ensure_recovered_anchor_children,
@@ -104,6 +106,14 @@ def assignment_quality(fields: dict[str, Any]) -> int:
     return score
 
 
+def template_quality(table_key: str, fields: dict[str, Any]) -> int:
+    if table_key == "node":
+        return 10 if text_value(fields.get("节点类型")).strip() in {item[0] for item in CHAIN_NODE_TEMPLATE} else 0
+    if table_key == "task":
+        return 10 if text_value(fields.get("任务类型")).strip() in {item[1] for item in TASK_TEMPLATE} else 0
+    return 0
+
+
 def plan_duplicate_child_cleanup(
     records: dict[str, list[dict[str, Any]]],
     updates: dict[str, dict[str, dict[str, Any]]],
@@ -141,6 +151,7 @@ def plan_duplicate_child_cleanup(
             canonical = max(
                 candidates,
                 key=lambda row: (
+                    template_quality(table_key, row.get("fields") or {}),
                     assignment_quality(row.get("fields") or {}),
                     text_value((row.get("fields") or {}).get("自动化批次")).strip(),
                     str(row.get("record_id") or ""),
