@@ -417,6 +417,12 @@ def feishu_record_worker() -> None:
     while True:
         table_id, record_id, transport = FEISHU_RECORD_QUEUE.get()
         try:
+            if not service_enabled():
+                app.logger.info(
+                    "Ignored Feishu interview event for %s while automation is disabled.",
+                    record_id,
+                )
+                continue
             fs = Feishu(tenant_token())
             result = sync_one_interview_personnel_assignment(fs, record_id, Path("runtime"))
             app.logger.info(
