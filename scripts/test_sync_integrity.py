@@ -10,6 +10,7 @@ from urllib.error import HTTPError
 import sync_missing_personal_entries as personal
 import sync_missing_workbench_rows as workbench
 from miyou_system_automation import TABLES, contact_api_with_retry, find_existing_anchor_for_interview, load_env, personnel_fields_changed, request_json, sync_selected_interview_assignments
+from repair_live_data_integrity import CHILD_SPECS, plan_duplicate_child_cleanup
 
 
 USER_ID = "ou_correct_user"
@@ -98,6 +99,36 @@ class FakeFeishu:
 
 
 class SyncIntegrityTests(unittest.TestCase):
+    def test_pristine_duplicate_children_keep_the_assigned_newer_row(self) -> None:
+        records = {key: [] for key in CHILD_SPECS}
+        records["task"] = [
+            {"record_id": "rec_old", "fields": {"对应主播": ["rec_anchor"], "任务名称": "主播甲 首次建联", "工作状态": "未开始", "负责人": "待分配", "自动化批次": "LIVE-20260801"}},
+            {"record_id": "rec_new", "fields": {"对应主播": ["rec_anchor"], "任务名称": "主播甲 首次建联", "工作状态": "未开始", "负责人": "运营甲", "自动化批次": "LIVE-20260822"}},
+        ]
+        updates = {key: {} for key in CHILD_SPECS}
+        deletes = {key: set() for key in CHILD_SPECS}
+
+        actions, protected = plan_duplicate_child_cleanup(records, updates, deletes)
+
+        self.assertEqual([], protected)
+        self.assertEqual("rec_new", actions[0]["canonical_record_id"])
+        self.assertEqual({"rec_old"}, deletes["task"])
+
+    def test_duplicate_children_with_progress_on_both_rows_are_protected(self) -> None:
+        records = {key: [] for key in CHILD_SPECS}
+        records["node"] = [
+            {"record_id": "rec_a", "fields": {"关联主播": ["rec_anchor"], "节点类型": "签约", "节点状态": "已完成", "交付物/附件": ["file-a"]}},
+            {"record_id": "rec_b", "fields": {"关联主播": ["rec_anchor"], "节点类型": "签约", "节点状态": "已完成", "交付物/附件": ["file-b"]}},
+        ]
+        updates = {key: {} for key in CHILD_SPECS}
+        deletes = {key: set() for key in CHILD_SPECS}
+
+        actions, protected = plan_duplicate_child_cleanup(records, updates, deletes)
+
+        self.assertEqual([], actions)
+        self.assertEqual(1, len(protected))
+        self.assertEqual(set(), deletes["node"])
+
     def test_feishu_frequency_limit_is_retried_with_backoff(self) -> None:
         payload = b'{"code":99991400,"msg":"request trigger frequency limit"}'
         calls = 0

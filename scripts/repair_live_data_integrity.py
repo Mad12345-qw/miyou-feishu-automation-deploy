@@ -30,12 +30,143 @@ from miyou_system_automation import (
 TRANSFER_FIELDS = ("通过转入主播", "面试通过，转入主播")
 CHILD_SPECS = {
     "node": ("关联主播", "节点类型"),
-    "task": ("对应主播", "任务类型"),
+    "task": ("对应主播", "任务名称"),
     "visual": ("关联主播", "singleton"),
     "training": ("关联主播", "singleton"),
     "first_live": ("关联主播", "singleton"),
 }
 SAFE_MERGE_FIELDS = ("主播编号", "照片", "招募经济人", "面试官", "真实姓名", "来源面试记录说明")
+EMPTY_VALUES = (None, "", [], {})
+
+
+def has_business_progress(table_key: str, fields: dict[str, Any]) -> bool:
+    if table_key == "node":
+        return any(
+            (
+                fields.get("交付物/附件") not in EMPTY_VALUES,
+                fields.get("实际完成时间") not in EMPTY_VALUES,
+                fields.get("异常原因") not in EMPTY_VALUES,
+                text_value(fields.get("节点状态")).strip() not in {"", "未开始"},
+                text_value(fields.get("节点验收结果")).strip() not in {"", "待验收"},
+            )
+        )
+    if table_key == "task":
+        return any(
+            (
+                fields.get("完成情况") not in EMPTY_VALUES,
+                fields.get("异常原因") not in EMPTY_VALUES,
+                fields.get("飞书日历事件ID") not in EMPTY_VALUES,
+                text_value(fields.get("工作状态")).strip() not in {"", "未开始"},
+            )
+        )
+    if table_key == "visual":
+        progress_fields = ("完成图片", "完成时间", "完成说明", "构图结论", "灯光参数", "美颜参数", "试镜视频")
+        check_fields = ("座椅", "素颜", "背景场地", "坐姿镜头", "服装", "发型", "6项核验是否全部通过")
+        return (
+            any(fields.get(name) not in EMPTY_VALUES for name in progress_fields)
+            or any(fields.get(name) is True for name in check_fields)
+            or text_value(fields.get("前置核验状态")).strip() not in {"", "未核验"}
+            or text_value(fields.get("需求状态")).strip() not in {"", "待接单"}
+        )
+    if table_key == "training":
+        acceptance_fields = ("基础话术验收", "姿态状态验收", "消费力感知验收", "突发处理验收", "账号搭建检查", "转化能力验收", "镜头感验收")
+        return (
+            fields.get("3分钟录屏") not in EMPTY_VALUES
+            or fields.get("不通过原因") not in EMPTY_VALUES
+            or fields.get("录屏时长（秒）") not in EMPTY_VALUES
+            or fields.get("是否允许进入首播") is True
+            or text_value(fields.get("培训状态")).strip() not in {"", "未开始"}
+            or text_value(fields.get("录屏审核状态")).strip() not in {"", "待提交"}
+            or any(text_value(fields.get(name)).strip() not in {"", "未验收"} for name in acceptance_fields)
+        )
+    progress_fields = ("优化方案", "后续直播计划", "复盘完成时间", "复盘附件", "首播亮点", "首播问题")
+    check_fields = ("设备检查", "网络检查", "美颜检查", "灯光检查", "服装检查")
+    return (
+        any(fields.get(name) not in EMPTY_VALUES for name in progress_fields)
+        or fields.get("是否1小时内复盘") is True
+        or fields.get("首播前检查是否通过") is not None
+        or text_value(fields.get("首播状态")).strip() not in {"", "待首播"}
+        or any(text_value(fields.get(name)).strip() not in {"", "未检查"} for name in check_fields)
+    )
+
+
+def assignment_quality(fields: dict[str, Any]) -> int:
+    score = 0
+    for value in fields.values():
+        if isinstance(value, list) and any(isinstance(item, dict) and (item.get("id") or item.get("user_id")) for item in value):
+            score += 2
+    for field_name in ("责任人", "负责人"):
+        value = text_value(fields.get(field_name)).strip()
+        if value and value != "待分配":
+            score += 1
+    display = text_value(fields.get(ANCHOR_DISPLAY_FIELD)).strip()
+    if display and " · " not in display:
+        score += 1
+    return score
+
+
+def plan_duplicate_child_cleanup(
+    records: dict[str, list[dict[str, Any]]],
+    updates: dict[str, dict[str, dict[str, Any]]],
+    deletes: dict[str, set[str]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    actions: list[dict[str, Any]] = []
+    protected: list[dict[str, Any]] = []
+    for table_key, (link_field, business_field) in CHILD_SPECS.items():
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        for row in records[table_key]:
+            row_id = str(row.get("record_id") or "")
+            if not row_id or row_id in deletes[table_key]:
+                continue
+            fields = row.get("fields") or {}
+            links = linked_record_ids((updates[table_key].get(row_id) or {}).get(link_field, fields.get(link_field)))
+            key = child_key(table_key, fields)
+            for anchor_id in links:
+                groups[(anchor_id, key)].append(row)
+        for (anchor_id, key), rows in sorted(groups.items()):
+            if not key or len(rows) <= 1:
+                continue
+            progressed = [row for row in rows if has_business_progress(table_key, row.get("fields") or {})]
+            if len(progressed) > 1:
+                protected.append(
+                    {
+                        "table": table_key,
+                        "anchor_id": anchor_id,
+                        "business_key": key,
+                        "record_ids": [str(row.get("record_id") or "") for row in rows],
+                        "reason": "Multiple duplicate rows contain business progress.",
+                    }
+                )
+                continue
+            candidates = progressed or rows
+            canonical = max(
+                candidates,
+                key=lambda row: (
+                    assignment_quality(row.get("fields") or {}),
+                    text_value((row.get("fields") or {}).get("自动化批次")).strip(),
+                    str(row.get("record_id") or ""),
+                ),
+            )
+            canonical_id = str(canonical.get("record_id") or "")
+            removed: list[str] = []
+            for row in rows:
+                row_id = str(row.get("record_id") or "")
+                if row_id == canonical_id:
+                    continue
+                deletes[table_key].add(row_id)
+                updates[table_key].pop(row_id, None)
+                removed.append(row_id)
+            actions.append(
+                {
+                    "table": table_key,
+                    "anchor_id": anchor_id,
+                    "business_key": key,
+                    "canonical_record_id": canonical_id,
+                    "deleted_record_ids": removed,
+                    "canonical_has_business_progress": bool(progressed),
+                }
+            )
+    return actions, protected
 
 
 def load_records(fs: Feishu) -> dict[str, list[dict[str, Any]]]:
@@ -200,10 +331,14 @@ def build_plan(records: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     if len(set(future_numbers.values())) != len(future_numbers):
         raise RuntimeError(f"Generated replacement anchor numbers are not unique: {future_numbers}")
 
+    duplicate_child_actions, protected_duplicate_children = plan_duplicate_child_cleanup(records, updates, deletes)
+
     return {
         "merge_pairs": merge_pairs,
         "orphan_actions": orphan_actions,
         "replacement_anchor_numbers": future_numbers,
+        "duplicate_child_actions": duplicate_child_actions,
+        "protected_duplicate_children": protected_duplicate_children,
         "updates": updates,
         "deletes": {key: sorted(values) for key, values in deletes.items()},
     }
@@ -284,6 +419,8 @@ def main() -> None:
         "updates": {key: len(value) for key, value in plan["updates"].items()},
         "deletes": {key: len(value) for key, value in plan["deletes"].items()},
         "replacement_anchor_numbers": len(plan["replacement_anchor_numbers"]),
+        "duplicate_child_actions": len(plan["duplicate_child_actions"]),
+        "protected_duplicate_children": len(plan["protected_duplicate_children"]),
     }
     if args.apply:
         snapshot = affected_snapshot(records, plan)
