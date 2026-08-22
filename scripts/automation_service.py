@@ -139,7 +139,13 @@ def run_personnel_entry_cycle() -> dict[str, object]:
         try:
             fs = Feishu(tenant_token())
             out_dir = Path("runtime")
-            display_repairs = sync_missing_interview_display_fields(fs, out_dir)
+            if INTERVIEW_INTEGRITY_LOCK.acquire(blocking=False):
+                try:
+                    display_repairs = sync_missing_interview_display_fields(fs, out_dir)
+                finally:
+                    INTERVIEW_INTEGRITY_LOCK.release()
+            else:
+                display_repairs = {"skipped": True, "reason": "Interview integrity sync is already running."}
             personnel = sync_personnel_directory(fs, out_dir)
             surface = ensure_interview_workflow_surface(fs, out_dir)
             dropdowns = sync_interview_personnel_dropdowns(fs, out_dir, sync_records=False)
@@ -147,7 +153,12 @@ def run_personnel_entry_cycle() -> dict[str, object]:
             personal_workbench = sync_missing_workbench_rows(fs, out_dir)
             business_failures = len(personal_views["view_sync"]["failed"])
             workbench_view_failures = len(personal_views["workbench_view_sync"]["failed"])
-            workbench_row_failures = max(0, personal_workbench["desired_rows"] - personal_workbench["created"])
+            workbench_row_failures = (
+                len(personal_workbench.get("failed") or [])
+                + len(personal_workbench.get("missing_views") or [])
+                + len(personal_workbench.get("conflicts") or [])
+                + len(personal_workbench.get("duplicate_rows") or [])
+            )
             provisioning_status = "ok" if not (business_failures or workbench_view_failures or workbench_row_failures) else "degraded"
             with PROVISIONING_STATE_LOCK:
                 LAST_PERSONNEL_PROVISIONING.update(
@@ -161,7 +172,9 @@ def run_personnel_entry_cycle() -> dict[str, object]:
                         "workbench_views_repaired": len(personal_views["workbench_view_sync"]["repaired"]),
                         "workbench_view_failures": workbench_view_failures,
                         "workbench_rows_created": personal_workbench["created"],
+                        "workbench_rows_repaired": personal_workbench.get("repaired", 0),
                         "workbench_row_failures": workbench_row_failures,
+                        "error": "",
                     }
                 )
             return {
@@ -203,6 +216,7 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
         return {"skipped": True, "reason": "Anchor transfer sync is already running."}
     started_at = datetime.now().astimezone()
     with ANCHOR_TRANSFER_STATE_LOCK:
+        LAST_ANCHOR_TRANSFER.clear()
         LAST_ANCHOR_TRANSFER.update(
             {
                 "status": "running",

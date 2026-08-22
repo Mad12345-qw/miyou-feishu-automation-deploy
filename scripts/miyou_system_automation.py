@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -821,17 +822,31 @@ def find_existing_anchor_for_interview(
 ) -> dict[str, Any] | None:
     fields = record.get("fields") or {}
     linked_ids = linked_record_ids(fields.get("关联主播档案"))
-    if linked_ids:
-        if anchors_by_id is None:
-            return {"record_id": linked_ids[0], "fields": {}}
-        for linked_id in linked_ids:
-            anchor = anchors_by_id.get(linked_id)
-            if anchor:
-                return anchor
     candidate_name = text_value(fields.get("候选人姓名")).strip()
+    expected_number = f"MYZB-AUTO-{record['record_id'][-10:]}"
+    if anchors_by_id is not None:
+        candidates: dict[str, dict[str, Any]] = {}
+        for anchor_id, anchor in anchors_by_id.items():
+            anchor_fields = anchor.get("fields") or {}
+            if (
+                anchor_id in linked_ids
+                or record["record_id"] in linked_record_ids(anchor_fields.get("来源面试记录"))
+                or (candidate_name and text_value(anchor_fields.get("主播编号")).strip() == expected_number)
+            ):
+                candidates[anchor_id] = anchor
+        if candidates:
+            def rank(anchor: dict[str, Any]) -> tuple[int, int, int]:
+                anchor_fields = anchor.get("fields") or {}
+                source_match = int(record["record_id"] in linked_record_ids(anchor_fields.get("来源面试记录")))
+                manually_maintained = int(not text_value(anchor_fields.get("自动化批次")).strip())
+                richness = sum(value not in (None, "", [], {}, False) for value in anchor_fields.values())
+                return source_match, manually_maintained, richness
+
+            return max(candidates.values(), key=rank)
+    elif linked_ids:
+        return {"record_id": linked_ids[0], "fields": {}}
     if not candidate_name:
         return None
-    expected_number = f"MYZB-AUTO-{record['record_id'][-10:]}"
     for anchor in fs.search_records(TABLES["anchor"], ANCHOR_NAME_FIELD, candidate_name, page_size=100):
         anchor_fields = anchor.get("fields") or {}
         if (
@@ -844,7 +859,7 @@ def find_existing_anchor_for_interview(
 
 def sync_selected_interview_assignments(fs: Feishu, records: list[dict[str, Any]]) -> dict[str, Any]:
     """Resolve visible personnel names to Feishu users for the supplied interviews."""
-    people: dict[str, list[dict[str, str]]] = {}
+    people_candidates: dict[str, list[list[dict[str, str]]]] = defaultdict(list)
     for person in fs.list_records(TABLES["personnel"], page_size=500):
         fields = person.get("fields") or {}
         if text_value(fields.get("在职状态")) != "在职" or text_value(fields.get("账号状态")) != "正常":
@@ -852,7 +867,13 @@ def sync_selected_interview_assignments(fs: Feishu, records: list[dict[str, Any]
         name = text_value(fields.get("姓名")).strip()
         users = [{"id": user_id} for user_id in user_ids(fields.get("飞书用户"))]
         if name and users:
-            people[name] = users
+            for alias in normalized_owner_names(fields.get("姓名"), fields.get("匹配别名")):
+                people_candidates[alias].append(users)
+    people = {
+        alias: candidates[0]
+        for alias, candidates in people_candidates.items()
+        if len({tuple(user_ids(users)) for users in candidates}) == 1
+    }
     updates: list[dict[str, Any]] = []
     unresolved: set[str] = set()
     for record in records:
@@ -1579,6 +1600,17 @@ def validate_batch(fs: Feishu, batch: str, out_dir: Path) -> dict[str, Any]:
     return report
 
 
+def contact_api_with_retry(fs: Feishu, path: str, query: dict[str, Any]) -> dict[str, Any]:
+    last_response: dict[str, Any] = {}
+    for attempt in range(4):
+        last_response = fs.api("GET", path, query)
+        if last_response.get("code") == 0:
+            return last_response
+        if attempt < 3:
+            time.sleep(1 + attempt * 2)
+    raise RuntimeError(f"Failed to read Feishu contacts from {path}: {last_response.get('msg') or last_response}")
+
+
 def list_contact_users(fs: Feishu) -> list[dict[str, Any]]:
     users_by_id: dict[str, dict[str, Any]] = {}
 
@@ -1588,9 +1620,7 @@ def list_contact_users(fs: Feishu) -> list[dict[str, Any]]:
             query = dict(base_query)
             if page_token:
                 query["page_token"] = page_token
-            data = fs.api("GET", path, query)
-            if data.get("code") != 0:
-                raise RuntimeError(f"Failed to list contact users from {path}: {data.get('msg') or data}")
+            data = contact_api_with_retry(fs, path, query)
             payload = data.get("data") or {}
             for user in payload.get("items") or []:
                 open_id = str(user.get("open_id") or "")
@@ -1619,8 +1649,8 @@ def list_contact_users(fs: Feishu) -> list[dict[str, Any]]:
 
 
 def list_contact_departments(fs: Feishu) -> dict[str, str]:
-    response = fs.api(
-        "GET",
+    response = contact_api_with_retry(
+        fs,
         "/contact/v3/departments",
         {
             "page_size": 50,
@@ -1634,8 +1664,8 @@ def list_contact_departments(fs: Feishu) -> dict[str, str]:
         department_id = str(item.get("open_department_id") or item.get("department_id") or "")
         name = str(item.get("name") or "").strip()
         if department_id and not name:
-            detail = fs.api(
-                "GET",
+            detail = contact_api_with_retry(
+                fs,
                 f"/contact/v3/departments/{department_id}",
                 {"department_id_type": "open_department_id"},
             )
@@ -1714,6 +1744,23 @@ def epoch_ms(value: Any) -> int | None:
     return int(value * 1000) if value < 100000000000 else int(value)
 
 
+def personnel_fields_changed(current: dict[str, Any], desired: dict[str, Any]) -> bool:
+    for name, value in desired.items():
+        current_value = current.get(name)
+        if name == "飞书用户":
+            if user_ids(current_value) != user_ids(value):
+                return True
+        elif name == "角色":
+            if sorted(list_value(current_value)) != sorted(list_value(value)):
+                return True
+        elif isinstance(value, (int, float)):
+            if not isinstance(current_value, (int, float)) or int(current_value) != int(value):
+                return True
+        elif current_value != value:
+            return True
+    return False
+
+
 def sync_personnel_directory(fs: Feishu, out_dir: Path) -> dict[str, Any]:
     full_sync = os.environ.get("CONTACT_FULL_SYNC_ENABLED", "false").lower() == "true"
     users = list_contact_users(fs)
@@ -1758,7 +1805,6 @@ def sync_personnel_directory(fs: Feishu, out_dir: Path) -> dict[str, Any]:
             "是否创建个人入口": employment_status == "在职" and account_status == "正常",
             "是否参与日历同步": employment_status == "在职" and account_status == "正常",
             "通讯录OpenID": open_id,
-            "最后同步时间": now_ms,
             "数据来源": "通讯录自动同步",
             "备注": "由系统从飞书通讯录自动同步；角色按部门自动识别，可由管理员锁定后手工调整。",
         }
@@ -1771,9 +1817,12 @@ def sync_personnel_directory(fs: Feishu, out_dir: Path) -> dict[str, Any]:
             fields["离职时间"] = now_ms
         row = {"fields": fields}
         if existing_record:
-            row["record_id"] = existing_record["record_id"]
-            updates.append(row)
+            if personnel_fields_changed(existing_fields, fields):
+                fields["最后同步时间"] = now_ms
+                row["record_id"] = existing_record["record_id"]
+                updates.append(row)
         else:
+            fields["最后同步时间"] = now_ms
             creates.append(row)
 
     for open_id, item in discovered.items():
@@ -1789,13 +1838,14 @@ def sync_personnel_directory(fs: Feishu, out_dir: Path) -> dict[str, Any]:
                 "是否创建个人入口": False,
                 "是否参与日历同步": False,
                 "通讯录OpenID": open_id,
-                "最后同步时间": now_ms,
                 "数据来源": "业务记录发现",
                 "备注": "仅在历史业务记录中发现，未被当前通讯录确认；默认不生成个人入口。",
             }
             if not existing_fields.get("手工锁定角色"):
                 changed["角色"] = sorted(set(list_value(existing_fields.get("角色"))) | set(item.get("roles") or []))
-            updates.append({"record_id": existing_record["record_id"], "fields": changed})
+            if personnel_fields_changed(existing_fields, changed):
+                changed["最后同步时间"] = now_ms
+                updates.append({"record_id": existing_record["record_id"], "fields": changed})
             continue
         creates.append(
             {
@@ -1823,20 +1873,17 @@ def sync_personnel_directory(fs: Feishu, out_dir: Path) -> dict[str, Any]:
                 continue
             fields = record.get("fields") or {}
             from_directory = text_value(fields.get("数据来源")) == "通讯录自动同步"
-            updates.append(
-                {
-                    "record_id": record["record_id"],
-                    "fields": {
-                        "在职状态": "离职" if from_directory else "停用",
-                        "账号状态": "已离职" if from_directory else "未知",
-                        "是否创建个人入口": False,
-                        "是否参与日历同步": False,
-                        "最后同步时间": now_ms,
-                        **({"离职时间": fields.get("离职时间") or now_ms} if from_directory else {}),
-                    },
-                }
-            )
-            deactivated += 1
+            changed = {
+                "在职状态": "离职" if from_directory else "停用",
+                "账号状态": "已离职" if from_directory else "未知",
+                "是否创建个人入口": False,
+                "是否参与日历同步": False,
+                **({"离职时间": fields.get("离职时间") or now_ms} if from_directory else {}),
+            }
+            if personnel_fields_changed(fields, changed):
+                changed["最后同步时间"] = now_ms
+                updates.append({"record_id": record["record_id"], "fields": changed})
+                deactivated += 1
 
     create_results = fs.batch_create(TABLES["personnel"], creates) if creates else []
     update_results = fs.batch_update(TABLES["personnel"], updates) if updates else []
@@ -1873,6 +1920,7 @@ def sync_interview_personnel_dropdowns(fs: Feishu, out_dir: Path, sync_records: 
         active_people.append(
             {
                 "name": name,
+                "aliases": normalized_owner_names(fields.get("姓名"), fields.get("匹配别名")),
                 "department": text_value(fields.get("组织部门")).strip(),
                 "roles": set(list_value(fields.get("角色"))),
                 "users": [{"id": user_id} for user_id in ids],
@@ -1923,6 +1971,7 @@ def sync_interview_personnel_dropdowns(fs: Feishu, out_dir: Path, sync_records: 
             raise RuntimeError(f"{visible_name} must be a single-select field after schema upgrade: {visible_field}")
 
     dropdown_people: dict[str, dict[str, list[dict[str, str]]]] = {}
+    input_people: dict[str, dict[str, list[dict[str, str]]]] = {}
     option_updates: list[dict[str, Any]] = []
     fields_by_name = {field.get("field_name"): field for field in fs.fields(table_id)}
     for visible_name, spec in INTERVIEW_PERSONNEL_DROPDOWNS.items():
@@ -1933,6 +1982,17 @@ def sync_interview_personnel_dropdowns(fs: Feishu, out_dir: Path, sync_records: 
             if not required_roles or set(person["roles"]).intersection(required_roles)
         }
         dropdown_people[visible_name] = matches
+        input_candidates: dict[str, list[list[dict[str, str]]]] = defaultdict(list)
+        for person in active_people:
+            if required_roles and not set(person["roles"]).intersection(required_roles):
+                continue
+            for alias in set(person.get("aliases") or set()) | {str(person["display_name"])}:
+                input_candidates[alias].append(person["users"])
+        input_people[visible_name] = {
+            alias: candidates[0]
+            for alias, candidates in input_candidates.items()
+            if len({tuple(user_ids(users)) for users in candidates}) == 1
+        }
         field = fields_by_name[visible_name]
         current_options = [
             str(option.get("name") or "")
@@ -1991,7 +2051,7 @@ def sync_interview_personnel_dropdowns(fs: Feishu, out_dir: Path, sync_records: 
             selected = text_value(fields.get(visible_name)).strip()
             existing_ids = user_ids(fields.get(account_name))
             if selected:
-                users = dropdown_people[visible_name].get(selected)
+                users = input_people[visible_name].get(selected)
                 if not users and visible_name == "招募人":
                     users = self_selected_creator_users(fields, selected)
                 if not users:
@@ -2110,6 +2170,7 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bo
             active_people.append(
                 {
                     "name": name,
+                    "aliases": normalized_owner_names(fields.get("姓名"), fields.get("匹配别名")),
                     "department": text_value(fields.get("组织部门")).strip(),
                     "roles": set(list_value(fields.get("角色"))),
                     "users": [{"id": user_id} for user_id in ids],
@@ -2124,6 +2185,7 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bo
             display_name = f"{display_name}（{person['department'] or person['users'][0]['id'][-6:]}）"
         person["display_name"] = display_name
     dropdown_people: dict[str, dict[str, list[dict[str, str]]]] = {}
+    input_people: dict[str, dict[str, list[dict[str, str]]]] = {}
     active_user_to_display: dict[str, dict[str, str]] = {}
     for visible_name, spec in INTERVIEW_PERSONNEL_DROPDOWNS.items():
         required_roles = set(spec["roles"])
@@ -2133,6 +2195,17 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bo
             if not required_roles or set(person["roles"]).intersection(required_roles)
         }
         dropdown_people[visible_name] = matches
+        input_candidates: dict[str, list[list[dict[str, str]]]] = defaultdict(list)
+        for person in active_people:
+            if required_roles and not set(person["roles"]).intersection(required_roles):
+                continue
+            for alias in set(person.get("aliases") or set()) | {str(person["display_name"])}:
+                input_candidates[alias].append(person["users"])
+        input_people[visible_name] = {
+            alias: candidates[0]
+            for alias, candidates in input_candidates.items()
+            if len({tuple(user_ids(users)) for users in candidates}) == 1
+        }
         active_user_to_display[visible_name] = {
             user["id"]: display_name
             for display_name, users in matches.items()
@@ -2146,7 +2219,7 @@ def sync_missing_interview_display_fields(fs: Feishu, out_dir: Path, dry_run: bo
             selected = text_value(fields.get(visible_name)).strip()
             existing_ids = user_ids(fields.get(account_name))
             if selected:
-                users = dropdown_people[visible_name].get(selected)
+                users = input_people[visible_name].get(selected)
                 if not users and visible_name == "招募人":
                     users = self_selected_creator_users(fields, selected)
                 if users and user_ids(users) != existing_ids:
@@ -2258,6 +2331,7 @@ def sync_one_interview_personnel_assignment(fs: Feishu, record_id: str, out_dir:
             active_people.append(
                 {
                     "name": name,
+                    "aliases": normalized_owner_names(fields.get("姓名"), fields.get("匹配别名")),
                     "department": text_value(fields.get("组织部门")).strip(),
                     "users": users,
                     "roles": set(list_value(fields.get("角色"))),
@@ -2274,7 +2348,12 @@ def sync_one_interview_personnel_assignment(fs: Feishu, record_id: str, out_dir:
         display_name = name
         if name_counts[name] > 1:
             display_name = f"{name}（{person['department'] or person['users'][0]['id'][-6:]}）"
-        people_by_name[display_name] = person["users"]
+        for alias in set(person.get("aliases") or set()) | {display_name}:
+            existing = people_by_name.get(alias)
+            if existing is None:
+                people_by_name[alias] = person["users"]
+            elif user_ids(existing) != user_ids(person["users"]):
+                people_by_name.pop(alias, None)
         for user in person["users"]:
             user_id = str(user["id"])
             display_by_user_id[user_id] = display_name

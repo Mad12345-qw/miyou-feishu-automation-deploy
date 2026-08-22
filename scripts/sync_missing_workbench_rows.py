@@ -2,66 +2,143 @@ from __future__ import annotations
 
 import json
 import os
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 from miyou_system_automation import APP_TOKEN, Feishu, TABLES, get_tenant_token, text_value, user_ids, write_json
+from sync_missing_personal_entries import SPECS, active_people, list_view_details, personal_display_name, view_filter_binding
 
 
-WORKBENCH_TABLE = os.environ.get("FEISHU_WORKBENCH_TABLE_ID", "").strip()
+WORKBENCH_TABLE = os.environ.get("FEISHU_WORKBENCH_TABLE_ID", "tblIcblT5703VGvp").strip()
 
 
-def list_views(fs: Feishu, table_id: str) -> list[dict[str, Any]]:
-    response = fs.api("GET", f"/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/views", {"page_size": 100})
-    if response.get("code") != 0:
-        raise RuntimeError(response)
-    return (response.get("data") or {}).get("items") or []
+def link_value(value: Any) -> str:
+    return str(value.get("link") or "") if isinstance(value, dict) else ""
 
 
-def sync_missing_workbench_rows(fs: Feishu, out_dir: Path) -> dict[str, Any]:
-    people = []
-    for record in fs.list_records(TABLES["personnel"], page_size=500):
-        fields = record.get("fields") or {}
-        if text_value(fields.get("在职状态")) != "在职" or text_value(fields.get("账号状态")) != "正常":
-            continue
-        if fields.get("是否创建个人入口") is not True:
-            continue
-        ids = user_ids(fields.get("飞书用户"))
-        if ids:
-            people.append({"name": text_value(fields.get("姓名")), "user_id": ids[0], "roles": fields.get("角色") or []})
+def sync_missing_workbench_rows(fs: Feishu, out_dir: Path, dry_run: bool = False) -> dict[str, Any]:
+    people = active_people(fs)
+    name_counts = Counter(str(person.get("name") or "").strip() for person in people.values())
+    duplicate_names = {name for name, count in name_counts.items() if name and count > 1}
 
-    view_specs = [
-        ("anchor", "运营_", "_主播", "对接运营", "主播", "打开我的主播"),
-        ("task", "运营_", "_日程", "对接运营", "日程", "打开我的日程"),
-        ("interview", "招聘_", "_候选人", "招募经纪人", "候选人", "打开我的候选人"),
-        ("interview", "面试_", "_候选人", "面试官", "面试候选人", "打开我的面试候选人"),
-        ("interview", "运营_", "_候选人", "对接运营", "对接候选人", "打开我的对接候选人"),
-        ("visual", "运营_", "_视觉", "对接运营", "视觉任务", "打开我的视觉任务"),
-        ("training", "运营_", "_培训", "培训运营", "培训", "打开我的培训"),
-        ("first_live", "运营_", "_首播", "跟播运营", "首播", "打开我的首播"),
-        ("review", "运营_", "_复盘", "跟播运营", "复盘", "打开我的复盘"),
-    ]
-    view_map: dict[str, dict[str, str]] = {}
-    for table_key, prefix, suffix, role, target, label in view_specs:
-        for view in list_views(fs, TABLES[table_key]):
-            name = str(view.get("view_name") or "")
-            if name.startswith(prefix) and name.endswith(suffix):
-                person_name = name[len(prefix) : -len(suffix)].strip("_")
-                base_url = os.environ.get("FEISHU_BASE_URL", "").strip().rstrip("/")
-                view_map.setdefault(person_name, {})[target] = f"{base_url}/base/{APP_TOKEN}?table={TABLES[table_key]}&view={view['view_id']}"
-
-    existing = fs.list_records(WORKBENCH_TABLE, page_size=500)
-    existing_keys = {text_value((record.get("fields") or {}).get("我要做什么")) for record in existing}
-    rows = []
-    for person in people:
-        name = person["name"]
-        for target, link in sorted(view_map.get(name, {}).items()):
-            key = f"个人入口：{name}的{target}"
-            if key in existing_keys:
+    table_keys = sorted({item[0] for item in SPECS})
+    field_ids = {
+        key: {str(field.get("field_name") or ""): str(field.get("field_id") or "") for field in fs.fields(TABLES[key])}
+        for key in table_keys
+    }
+    views_by_binding: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for table_key in table_keys:
+        for detail in list_view_details(fs, TABLES[table_key]):
+            if detail.get("_detail_error"):
                 continue
-            rows.append({"fields": {"我要做什么": key, "谁来操作": "本人", "操作内容": f"{name}直接查看自己的{target}", "系统自动": "系统按飞书人员账号自动筛选本人记录", "完成时限": "每天使用", "点这里办理": {"link": link, "text": f"打开我的{target}"}, "员工账号": [{"id": person["user_id"]}]}})
-    results = fs.batch_create(WORKBENCH_TABLE, rows, batch_size=500) if rows else []
-    report = {"people": len(people), "desired_rows": len(rows), "created": sum(len(((r.get("data") or {}).get("records") or [])) for r in results), "results": results}
+            field_id, user_id = view_filter_binding(detail)
+            if field_id and user_id:
+                views_by_binding[(table_key, field_id, user_id)].append(detail)
+
+    base_url = os.environ.get("FEISHU_BASE_URL", "https://hxyyb89w4s2.feishu.cn").strip().rstrip("/")
+    desired: dict[str, dict[str, Any]] = {}
+    valid_links_by_key: dict[str, set[str]] = defaultdict(set)
+    missing_views: list[dict[str, str]] = []
+    conflicts: list[dict[str, Any]] = []
+    for user_id, person in people.items():
+        name = str(person.get("name") or "").strip()
+        roles = set(person.get("roles") or set())
+        if not name:
+            continue
+        for table_key, field_name, _prefix, _suffix, accepted_roles, target, label in SPECS:
+            if not roles.intersection(accepted_roles):
+                continue
+            field_id = field_ids[table_key].get(field_name, "")
+            bound_views = views_by_binding.get((table_key, field_id, user_id)) or []
+            if not bound_views:
+                missing_views.append({"name": name, "user_id": user_id, "table": table_key, "field": field_name, "target": target})
+                continue
+            selected = min(bound_views, key=lambda item: len(str(item.get("view_name") or "")))
+            view_id = str(selected.get("view_id") or "")
+            display_name = personal_display_name(name, user_id, duplicate_names)
+            key = f"个人入口：{display_name}的{target}"
+            valid_links_by_key[key].update(
+                f"{base_url}/base/{APP_TOKEN}?table={TABLES[table_key]}&view={str(view.get('view_id') or '')}"
+                for view in bound_views
+                if view.get("view_id")
+            )
+            fields = {
+                "我要做什么": key,
+                "谁来操作": "本人",
+                "操作内容": f"{display_name}直接查看自己的{target}",
+                "系统自动": "系统按飞书人员账号自动筛选本人记录",
+                "完成时限": "每天使用",
+                "点这里办理": {
+                    "link": f"{base_url}/base/{APP_TOKEN}?table={TABLES[table_key]}&view={view_id}",
+                    "text": label,
+                },
+                "员工账号": [{"id": user_id}],
+            }
+            previous = desired.get(key)
+            if previous and link_value(previous["点这里办理"]) != link_value(fields["点这里办理"]):
+                conflicts.append({"key": key, "first_link": link_value(previous["点这里办理"]), "second_link": link_value(fields["点这里办理"])})
+                continue
+            desired[key] = fields
+
+    existing_records = fs.list_records(WORKBENCH_TABLE, page_size=500)
+    existing_by_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in existing_records:
+        key = text_value((record.get("fields") or {}).get("我要做什么")).strip()
+        if key.startswith("个人入口："):
+            existing_by_key[key].append(record)
+
+    duplicate_rows = [
+        {"key": key, "record_ids": [str(record.get("record_id") or "") for record in records]}
+        for key, records in existing_by_key.items()
+        if len(records) > 1
+    ]
+    creates: list[dict[str, Any]] = []
+    updates: list[dict[str, Any]] = []
+    unchanged: list[str] = []
+    for key, fields in desired.items():
+        records = existing_by_key.get(key) or []
+        if not records:
+            creates.append({"fields": fields})
+            continue
+        record = records[0]
+        current = record.get("fields") or {}
+        current_link = link_value(current.get("点这里办理"))
+        if current_link in valid_links_by_key.get(key, set()):
+            fields["点这里办理"]["link"] = current_link
+        same = (
+            user_ids(current.get("员工账号")) == user_ids(fields.get("员工账号"))
+            and link_value(current.get("点这里办理")) == link_value(fields.get("点这里办理"))
+            and text_value(current.get("谁来操作")) == fields["谁来操作"]
+            and text_value(current.get("操作内容")) == fields["操作内容"]
+            and text_value(current.get("系统自动")) == fields["系统自动"]
+            and text_value(current.get("完成时限")) == fields["完成时限"]
+        )
+        if same:
+            unchanged.append(key)
+        else:
+            updates.append({"record_id": record["record_id"], "fields": fields})
+
+    create_results = [] if dry_run or not creates else fs.batch_create(WORKBENCH_TABLE, creates, batch_size=500)
+    update_results = [] if dry_run or not updates else fs.batch_update(WORKBENCH_TABLE, updates, batch_size=500)
+    failed = [result for result in [*create_results, *update_results] if result.get("code") != 0]
+    report = {
+        "mode": "dry_run" if dry_run else "apply",
+        "people": len(people),
+        "desired_rows": len(desired),
+        "planned_created": len(creates),
+        "planned_repaired": len(updates),
+        "created": 0 if dry_run else sum(len(((result.get("data") or {}).get("records") or [])) for result in create_results if result.get("code") == 0),
+        "repaired": 0 if dry_run else sum(len(((result.get("data") or {}).get("records") or [])) for result in update_results if result.get("code") == 0),
+        "unchanged": len(unchanged),
+        "missing_views": missing_views,
+        "conflicts": conflicts,
+        "duplicate_rows": duplicate_rows,
+        "duplicate_view_bindings": sum(1 for views in views_by_binding.values() if len(views) > 1),
+        "failed": failed,
+        "create_results": create_results,
+        "update_results": update_results,
+    }
     write_json(out_dir / "sync_missing_workbench_rows_result.json", report)
     return report
 
@@ -69,7 +146,8 @@ def sync_missing_workbench_rows(fs: Feishu, out_dir: Path) -> dict[str, Any]:
 def main() -> None:
     fs = Feishu(get_tenant_token(Path("feishu/.env.local")))
     report = sync_missing_workbench_rows(fs, Path("scripts/runtime"))
-    print(json.dumps({"people": report["people"], "desired_rows": report["desired_rows"], "created": report["created"]}, ensure_ascii=False))
+    keys = ("people", "desired_rows", "created", "repaired", "unchanged", "missing_views", "conflicts", "duplicate_rows")
+    print(json.dumps({key: report[key] for key in keys}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +46,26 @@ def list_views(fs: Feishu, table_id: str) -> list[dict[str, Any]]:
             return views
 
 
+def list_view_details(fs: Feishu, table_id: str) -> list[dict[str, Any]]:
+    summaries = [view for view in list_views(fs, table_id) if view.get("view_type") == "grid"]
+
+    def read(summary: dict[str, Any]) -> dict[str, Any]:
+        view_id = str(summary.get("view_id") or "")
+        response = fs.api("GET", f"/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/views/{view_id}")
+        if response.get("code") != 0:
+            return {**summary, "_detail_error": response}
+        detail = (response.get("data") or {}).get("view") or response.get("data") or {}
+        return {**summary, **detail}
+
+    details: list[dict[str, Any]] = []
+    workers = max(1, min(8, int(os.environ.get("FEISHU_VIEW_READ_WORKERS", "6"))))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(read, summary) for summary in summaries]
+        for future in as_completed(futures):
+            details.append(future.result())
+    return details
+
+
 def active_people(fs: Feishu) -> dict[str, dict[str, Any]]:
     people: dict[str, dict[str, Any]] = {}
     for record in fs.list_records(TABLES["personnel"], page_size=500):
@@ -63,18 +85,32 @@ def active_people(fs: Feishu) -> dict[str, dict[str, Any]]:
     return people
 
 
-def workbench_view_user_id(view: dict[str, Any], employee_field_id: str) -> str:
+def view_filter_binding(view: dict[str, Any]) -> tuple[str, str]:
     conditions = (((view.get("property") or {}).get("filter_info") or {}).get("conditions") or [])
-    for condition in conditions:
-        if str(condition.get("field_id") or "") != employee_field_id or condition.get("operator") != "is":
-            continue
-        try:
-            values = json.loads(str(condition.get("value") or "[]"))
-        except json.JSONDecodeError:
-            continue
-        if isinstance(values, list) and len(values) == 1:
-            return str(values[0])
-    return ""
+    if len(conditions) != 1:
+        return "", ""
+    condition = conditions[0]
+    if condition.get("operator") != "is":
+        return "", ""
+    try:
+        values = json.loads(str(condition.get("value") or "[]"))
+    except json.JSONDecodeError:
+        return "", ""
+    if not isinstance(values, list) or len(values) != 1:
+        return "", ""
+    value = values[0]
+    if isinstance(value, dict):
+        value = value.get("id") or value.get("open_id") or value.get("user_id")
+    return str(condition.get("field_id") or ""), str(value or "")
+
+
+def workbench_view_user_id(view: dict[str, Any], employee_field_id: str) -> str:
+    field_id, user_id = view_filter_binding(view)
+    return user_id if field_id == employee_field_id else ""
+
+
+def personal_display_name(name: str, user_id: str, duplicate_names: set[str]) -> str:
+    return name if name not in duplicate_names else f"{name}（{user_id[-6:]}）"
 
 
 def sync_personal_workbench_views(
@@ -184,16 +220,35 @@ def sync_personal_workbench_views(
     }
 
 
-def create_missing_business_views(fs: Feishu, people: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def create_missing_business_views(
+    fs: Feishu,
+    people: dict[str, dict[str, Any]],
+    dry_run: bool = False,
+) -> dict[str, Any]:
     table_keys = sorted({item[0] for item in SPECS})
     field_ids = {
         key: {field.get("field_name"): field.get("field_id") for field in fs.fields(TABLES[key])}
         for key in table_keys
     }
-    views = {key: {str(view.get("view_name") or ""): view for view in list_views(fs, TABLES[key])} for key in table_keys}
+    views: dict[str, dict[str, dict[str, Any]]] = {}
+    views_by_binding: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for key in table_keys:
+        views[key] = {}
+        for detail in list_view_details(fs, TABLES[key]):
+            views[key][str(detail.get("view_name") or "")] = detail
+            if detail.get("_detail_error"):
+                continue
+            field_id, bound_user_id = view_filter_binding(detail)
+            if field_id and bound_user_id:
+                views_by_binding.setdefault((key, field_id, bound_user_id), []).append(detail)
     created: list[dict[str, Any]] = []
-    existing: list[str] = []
+    repaired: list[dict[str, Any]] = []
+    existing: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    duplicate_bindings: list[dict[str, Any]] = []
+    planned: list[dict[str, Any]] = []
+    name_counts = Counter(str(person.get("name") or "").strip() for person in people.values())
+    duplicate_names = {name for name, count in name_counts.items() if name and count > 1}
     for user_id, person in people.items():
         name = str(person["name"] or "").strip()
         if not name:
@@ -205,20 +260,32 @@ def create_missing_business_views(fs: Feishu, people: dict[str, dict[str, Any]])
             if not field_id:
                 failed.append({"name": name, "table": table_key, "reason": f"Missing field {field_name}"})
                 continue
-            view_name = f"{prefix}_{name}_{suffix}"[:100]
-            if view_name in views[table_key]:
-                existing.append(view_name)
+            display_name = personal_display_name(name, user_id, duplicate_names)
+            view_name = f"{prefix}_{display_name}_{suffix}"[:100]
+            named_view = views[table_key].get(view_name)
+            exact_views = views_by_binding.get((table_key, str(field_id), user_id)) or []
+            if len(exact_views) > 1:
+                duplicate_bindings.append({"name": name, "table": table_key, "field": field_name, "user_id": user_id, "view_ids": [item.get("view_id") for item in exact_views]})
+            if exact_views:
+                selected = next((item for item in exact_views if str(item.get("view_name") or "") == view_name), exact_views[0])
+                existing.append({"name": name, "table": table_key, "view_name": selected.get("view_name"), "view_id": selected.get("view_id")})
                 continue
-            response = fs.api(
-                "POST",
-                f"/bitable/v1/apps/{APP_TOKEN}/tables/{TABLES[table_key]}/views",
-                body={"view_name": view_name, "view_type": "grid"},
-            )
-            view = (response.get("data") or {}).get("view") or response.get("data") or {}
-            view_id = str(view.get("view_id") or "")
-            if response.get("code") != 0 or not view_id:
-                failed.append({"name": name, "table": table_key, "reason": response})
+            action = "repair" if named_view else "create"
+            planned.append({"action": action, "name": name, "table": table_key, "view_name": view_name, "user_id": user_id})
+            if dry_run:
                 continue
+            view_id = str((named_view or {}).get("view_id") or "")
+            if not view_id:
+                response = fs.api(
+                    "POST",
+                    f"/bitable/v1/apps/{APP_TOKEN}/tables/{TABLES[table_key]}/views",
+                    body={"view_name": view_name, "view_type": "grid"},
+                )
+                view = (response.get("data") or {}).get("view") or response.get("data") or {}
+                view_id = str(view.get("view_id") or "")
+                if response.get("code") != 0 or not view_id:
+                    failed.append({"name": name, "table": table_key, "reason": response})
+                    continue
             patch = fs.api(
                 "PATCH",
                 f"/bitable/v1/apps/{APP_TOKEN}/tables/{TABLES[table_key]}/views/{view_id}",
@@ -235,10 +302,12 @@ def create_missing_business_views(fs: Feishu, people: dict[str, dict[str, Any]])
             if patch.get("code") != 0:
                 failed.append({"name": name, "table": table_key, "reason": patch})
                 continue
-            views[table_key][view_name] = {"view_id": view_id, "view_name": view_name}
-            created.append({"name": name, "table": table_key, "view_name": view_name, "view_id": view_id})
+            item = {"name": name, "table": table_key, "view_name": view_name, "view_id": view_id}
+            views[table_key][view_name] = {**item, "property": {"filter_info": {"conditions": [{"field_id": field_id, "operator": "is", "value": json.dumps([user_id], ensure_ascii=False)}]}}}
+            views_by_binding.setdefault((table_key, str(field_id), user_id), []).append(views[table_key][view_name])
+            (repaired if action == "repair" else created).append(item)
             time.sleep(0.25)
-    return {"created": created, "existing": existing, "failed": failed, "views": views}
+    return {"mode": "dry_run" if dry_run else "apply", "planned": planned, "created": created, "repaired": repaired, "existing": existing, "failed": failed, "duplicate_bindings": duplicate_bindings, "views": views}
 
 
 def sync_missing_personal_entries(fs: Feishu, out_dir: Path, dry_run_workbench: bool = False) -> dict[str, Any]:
