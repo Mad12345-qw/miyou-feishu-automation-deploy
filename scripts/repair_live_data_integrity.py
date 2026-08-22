@@ -83,7 +83,7 @@ def build_plan(records: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
         skeleton_id = str(skeleton["record_id"])
         rich_id = str(rich["record_id"])
         linked_ids = linked_record_ids((interview.get("fields") or {}).get("关联主播档案"))
-        if linked_ids != [skeleton_id]:
+        if linked_ids not in ([skeleton_id], [rich_id]):
             raise RuntimeError(f"Unexpected canonical link for duplicate interview {interview_id}: {linked_ids}")
 
         rich_fields = rich.get("fields") or {}
