@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import unittest
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 import sync_missing_personal_entries as personal
 import sync_missing_workbench_rows as workbench
-from miyou_system_automation import TABLES, contact_api_with_retry, find_existing_anchor_for_interview, load_env, personnel_fields_changed, sync_selected_interview_assignments
+from miyou_system_automation import TABLES, contact_api_with_retry, find_existing_anchor_for_interview, load_env, personnel_fields_changed, request_json, sync_selected_interview_assignments
 
 
 USER_ID = "ou_correct_user"
@@ -96,6 +98,35 @@ class FakeFeishu:
 
 
 class SyncIntegrityTests(unittest.TestCase):
+    def test_feishu_frequency_limit_is_retried_with_backoff(self) -> None:
+        payload = b'{"code":99991400,"msg":"request trigger frequency limit"}'
+        calls = 0
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"code":0,"data":{"ok":true}}'
+
+        def open_url(_request, timeout):
+            nonlocal calls
+            self.assertEqual(90, timeout)
+            calls += 1
+            if calls == 1:
+                raise HTTPError("https://open.feishu.cn/test", 400, "Bad Request", {}, BytesIO(payload))
+            return Response()
+
+        with patch("miyou_system_automation.urllib.request.urlopen", side_effect=open_url), patch("miyou_system_automation.time.sleep") as sleep:
+            result = request_json("GET", "https://open.feishu.cn/test")
+
+        self.assertEqual(0, result["code"])
+        self.assertEqual(2, calls)
+        sleep.assert_called_once_with(2.0)
+
     def test_env_loader_removes_systemd_style_quotes(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "service.env"

@@ -24,6 +24,7 @@ PERSONNEL_ENTRY_LOCK = threading.Lock()
 ANCHOR_TRANSFER_LOCK = threading.Lock()
 REPORTING_LOCK = threading.Lock()
 INTERVIEW_INTEGRITY_LOCK = threading.Lock()
+FEISHU_SCAN_LOCK = threading.Lock()
 FEISHU_EVENT_LOCK = threading.Lock()
 PROVISIONING_STATE_LOCK = threading.Lock()
 ANCHOR_TRANSFER_STATE_LOCK = threading.Lock()
@@ -135,6 +136,9 @@ def run_personnel_entry_cycle() -> dict[str, object]:
     """Keep new employee entry creation independent from heavy business jobs."""
     if not PERSONNEL_ENTRY_LOCK.acquire(blocking=False):
         return {"skipped": True, "reason": "Personnel entry sync is already running."}
+    if not FEISHU_SCAN_LOCK.acquire(blocking=False):
+        PERSONNEL_ENTRY_LOCK.release()
+        return {"skipped": True, "reason": "Another Feishu full scan is already running."}
     try:
         try:
             fs = Feishu(tenant_token())
@@ -196,15 +200,20 @@ def run_personnel_entry_cycle() -> dict[str, object]:
                 )
             raise
     finally:
+        FEISHU_SCAN_LOCK.release()
         PERSONNEL_ENTRY_LOCK.release()
 
 
 def run_interview_integrity_cycle() -> dict[str, object]:
     if not INTERVIEW_INTEGRITY_LOCK.acquire(blocking=False):
         return {"skipped": True, "reason": "Interview integrity sync is already running."}
+    if not FEISHU_SCAN_LOCK.acquire(blocking=False):
+        INTERVIEW_INTEGRITY_LOCK.release()
+        return {"skipped": True, "reason": "Another Feishu full scan is already running."}
     try:
         return sync_missing_interview_display_fields(Feishu(tenant_token()), Path("runtime"))
     finally:
+        FEISHU_SCAN_LOCK.release()
         INTERVIEW_INTEGRITY_LOCK.release()
 
 
@@ -214,6 +223,9 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
         raise RuntimeError("Automation is disabled. Set AUTOMATION_ENABLED=true after cutover approval.")
     if not ANCHOR_TRANSFER_LOCK.acquire(blocking=False):
         return {"skipped": True, "reason": "Anchor transfer sync is already running."}
+    if not FEISHU_SCAN_LOCK.acquire(blocking=False):
+        ANCHOR_TRANSFER_LOCK.release()
+        return {"skipped": True, "reason": "Another Feishu full scan is already running."}
     started_at = datetime.now().astimezone()
     with ANCHOR_TRANSFER_STATE_LOCK:
         LAST_ANCHOR_TRANSFER.clear()
@@ -278,6 +290,7 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
             )
         raise
     finally:
+        FEISHU_SCAN_LOCK.release()
         ANCHOR_TRANSFER_LOCK.release()
 
 
@@ -342,7 +355,9 @@ def run_live_cycle() -> dict[str, object]:
 
 
 def background_scheduler() -> None:
-    def worker(name: str, interval: int, enabled: callable, action: callable) -> None:
+    def worker(name: str, interval: int, initial_delay: int, enabled: callable, action: callable) -> None:
+        if initial_delay > 0:
+            time.sleep(initial_delay)
         while True:
             if enabled():
                 try:
@@ -355,15 +370,15 @@ def background_scheduler() -> None:
     # a user to re-enter the same assignment in a second table.
     base_interval = max(60, int(os.environ.get("AUTOMATION_INTERVAL_SECONDS", "60")))
     workers = [
-        ("Interview integrity sync", base_interval, personnel_dropdown_sync_enabled, run_interview_integrity_cycle),
-        ("Personnel entry sync", max(60, min(base_interval, 180)), personnel_dropdown_sync_enabled, run_personnel_entry_cycle),
-        ("Anchor transfer sync", max(60, min(base_interval, 180)), service_enabled, run_anchor_transfer_cycle),
-        ("Reporting sync", max(300, base_interval * 3), lambda: service_enabled() and reporting_sync_enabled(), run_reporting_cycle),
+        ("Interview integrity sync", base_interval, 0, personnel_dropdown_sync_enabled, run_interview_integrity_cycle),
+        ("Personnel entry sync", max(60, min(base_interval, 180)), 20, personnel_dropdown_sync_enabled, run_personnel_entry_cycle),
+        ("Anchor transfer sync", max(60, min(base_interval, 180)), 40, service_enabled, run_anchor_transfer_cycle),
+        ("Reporting sync", max(300, base_interval * 3), 60, lambda: service_enabled() and reporting_sync_enabled(), run_reporting_cycle),
     ]
     if mobile_form_configured():
-        workers.insert(0, ("Mobile form entry sync", base_interval, lambda: True, sync_mobile_form_entry))
-    for name, interval, enabled, action in workers:
-        threading.Thread(target=worker, args=(name, interval, enabled, action), daemon=True, name=name).start()
+        workers.insert(0, ("Mobile form entry sync", base_interval, 10, lambda: True, sync_mobile_form_entry))
+    for name, interval, initial_delay, enabled, action in workers:
+        threading.Thread(target=worker, args=(name, interval, initial_delay, enabled, action), daemon=True, name=name).start()
     while True:
         time.sleep(3600)
 

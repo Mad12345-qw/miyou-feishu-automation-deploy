@@ -133,7 +133,7 @@ def request_json(method: str, url: str, headers: dict[str, str] | None = None, b
         data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         merged_headers.setdefault("Content-Type", "application/json; charset=utf-8")
     last_error: Exception | None = None
-    for attempt in range(5):
+    for attempt in range(8):
         req = urllib.request.Request(url, data=data, headers=merged_headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=90) as resp:
@@ -145,8 +145,18 @@ def request_json(method: str, url: str, headers: dict[str, str] | None = None, b
                 error_payload = json.loads(text)
             except json.JSONDecodeError:
                 error_payload = {}
-            if (error_payload.get("code") in {1254607, 2200} or exc.code >= 500) and attempt < 4:
-                time.sleep(1 + attempt * 2)
+            error_code = error_payload.get("code")
+            rate_limited = error_code == 99991400 or exc.code == 429
+            retryable = rate_limited or error_code in {1254607, 2200} or exc.code >= 500
+            retry_limit = 7 if rate_limited else 4
+            if retryable and attempt < retry_limit:
+                retry_after = 0.0
+                try:
+                    retry_after = float(exc.headers.get("Retry-After", "0") or 0)
+                except (AttributeError, TypeError, ValueError):
+                    retry_after = 0.0
+                delay = max(retry_after, min(30.0, float(2 ** (attempt + 1)))) if rate_limited else 1 + attempt * 2
+                time.sleep(delay)
                 continue
             raise RuntimeError(f"{method} {url} failed HTTP {exc.code}: {text}") from exc
         except (urllib.error.URLError, ConnectionResetError, TimeoutError) as exc:

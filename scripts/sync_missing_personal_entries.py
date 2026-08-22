@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,6 +13,8 @@ from miyou_system_automation import APP_TOKEN, Feishu, TABLES, get_tenant_token,
 
 
 WORKBENCH_TABLE = os.environ.get("FEISHU_WORKBENCH_TABLE_ID", "").strip()
+VIEW_READ_LOCK = threading.Lock()
+VIEW_READ_LAST_AT = 0.0
 
 SPECS = [
     ("interview", "招募人账号（系统）", "招聘", "候选人", {"招募经纪人"}, "候选人", "打开我的候选人"),
@@ -50,6 +53,13 @@ def list_view_details(fs: Feishu, table_id: str) -> list[dict[str, Any]]:
     summaries = [view for view in list_views(fs, table_id) if view.get("view_type") == "grid"]
 
     def read(summary: dict[str, Any]) -> dict[str, Any]:
+        global VIEW_READ_LAST_AT
+        min_interval = max(0.0, float(os.environ.get("FEISHU_VIEW_READ_MIN_INTERVAL_SECONDS", "0.25")))
+        with VIEW_READ_LOCK:
+            wait_seconds = min_interval - (time.monotonic() - VIEW_READ_LAST_AT)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            VIEW_READ_LAST_AT = time.monotonic()
         view_id = str(summary.get("view_id") or "")
         response = fs.api("GET", f"/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/views/{view_id}")
         if response.get("code") != 0:
@@ -58,7 +68,7 @@ def list_view_details(fs: Feishu, table_id: str) -> list[dict[str, Any]]:
         return {**summary, **detail}
 
     details: list[dict[str, Any]] = []
-    workers = max(1, min(8, int(os.environ.get("FEISHU_VIEW_READ_WORKERS", "6"))))
+    workers = max(1, min(4, int(os.environ.get("FEISHU_VIEW_READ_WORKERS", "2"))))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(read, summary) for summary in summaries]
         for future in as_completed(futures):
