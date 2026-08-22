@@ -5,8 +5,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from miyou_system_automation import APP_TOKEN, TABLES, Feishu, get_tenant_token, linked_record_ids, text_value, write_json
-from repair_live_data_integrity import CHILD_SPECS, child_key, load_records
+from audit_live_sync_integrity import CHILD_SPECS
+from miyou_system_automation import Feishu, get_tenant_token, linked_record_ids, text_value, write_json
+from repair_live_data_integrity import load_records
 
 
 def inspect(records: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
@@ -16,11 +17,11 @@ def inspect(records: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
         if row.get("record_id")
     }
     groups: list[dict[str, Any]] = []
-    for table_key, (link_field, _business_field) in CHILD_SPECS.items():
+    for table_key, (link_field, _expected_count, unique_field) in CHILD_SPECS.items():
         grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
         for row in records[table_key]:
             fields = row.get("fields") or {}
-            key = child_key(table_key, fields)
+            key = text_value(fields.get(unique_field)).strip() if unique_field else "singleton"
             for anchor_id in linked_record_ids(fields.get(link_field)):
                 grouped[(anchor_id, key)].append(row)
         for (anchor_id, key), rows in sorted(grouped.items()):
