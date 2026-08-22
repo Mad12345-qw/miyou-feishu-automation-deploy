@@ -370,10 +370,10 @@ def background_scheduler() -> None:
     # a user to re-enter the same assignment in a second table.
     base_interval = max(60, int(os.environ.get("AUTOMATION_INTERVAL_SECONDS", "60")))
     workers = [
-        ("Interview integrity sync", base_interval, 0, personnel_dropdown_sync_enabled, run_interview_integrity_cycle),
-        ("Personnel entry sync", max(60, min(base_interval, 180)), 20, personnel_dropdown_sync_enabled, run_personnel_entry_cycle),
-        ("Anchor transfer sync", max(60, min(base_interval, 180)), 40, service_enabled, run_anchor_transfer_cycle),
-        ("Reporting sync", max(300, base_interval * 3), 60, lambda: service_enabled() and reporting_sync_enabled(), run_reporting_cycle),
+        ("Anchor transfer sync", max(60, min(base_interval, 180)), 0, service_enabled, run_anchor_transfer_cycle),
+        ("Personnel entry sync", max(60, min(base_interval, 180)), 30, personnel_dropdown_sync_enabled, run_personnel_entry_cycle),
+        ("Interview integrity sync", base_interval, 60, personnel_dropdown_sync_enabled, run_interview_integrity_cycle),
+        ("Reporting sync", max(300, base_interval * 3), 90, lambda: service_enabled() and reporting_sync_enabled(), run_reporting_cycle),
     ]
     if mobile_form_configured():
         workers.insert(0, ("Mobile form entry sync", base_interval, 10, lambda: True, sync_mobile_form_entry))
