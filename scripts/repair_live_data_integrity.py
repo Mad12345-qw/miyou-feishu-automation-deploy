@@ -38,6 +38,18 @@ CHILD_SPECS = {
 }
 SAFE_MERGE_FIELDS = ("主播编号", "照片", "招募经济人", "面试官", "真实姓名", "来源面试记录说明")
 EMPTY_VALUES = (None, "", [], {})
+TASK_PROGRESS_TRANSFER_FIELDS = (
+    "完成情况",
+    "工作状态",
+    "异常原因",
+    "负责人",
+    "运营经济人",
+    "飞书日历事件ID",
+    "是否同步飞书日历",
+    "开始时间",
+    "结束时间",
+    "日期",
+)
 
 
 def has_business_progress(table_key: str, fields: dict[str, Any]) -> bool:
@@ -147,7 +159,8 @@ def plan_duplicate_child_cleanup(
                     }
                 )
                 continue
-            candidates = progressed or rows
+            standard_rows = [row for row in rows if template_quality(table_key, row.get("fields") or {}) > 0]
+            candidates = standard_rows if len(standard_rows) == 1 else (progressed or rows)
             canonical = max(
                 candidates,
                 key=lambda row: (
@@ -158,6 +171,18 @@ def plan_duplicate_child_cleanup(
                 ),
             )
             canonical_id = str(canonical.get("record_id") or "")
+            migrated_fields: list[str] = []
+            if table_key == "task" and progressed and canonical_id != str(progressed[0].get("record_id") or ""):
+                source_fields = progressed[0].get("fields") or {}
+                canonical_fields = canonical.get("fields") or {}
+                changes = updates[table_key].setdefault(canonical_id, {})
+                protected_fields = {link_field, business_field, "任务类型", ANCHOR_DISPLAY_FIELD, "自动化批次"}
+                for field_name, value in source_fields.items():
+                    if field_name in protected_fields or value in EMPTY_VALUES:
+                        continue
+                    if field_name in TASK_PROGRESS_TRANSFER_FIELDS or canonical_fields.get(field_name) in EMPTY_VALUES:
+                        changes[field_name] = value
+                        migrated_fields.append(field_name)
             removed: list[str] = []
             for row in rows:
                 row_id = str(row.get("record_id") or "")
@@ -174,6 +199,7 @@ def plan_duplicate_child_cleanup(
                     "canonical_record_id": canonical_id,
                     "deleted_record_ids": removed,
                     "canonical_has_business_progress": bool(progressed),
+                    "migrated_fields": sorted(set(migrated_fields)),
                 }
             )
     return actions, protected

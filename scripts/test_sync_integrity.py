@@ -144,6 +144,24 @@ class SyncIntegrityTests(unittest.TestCase):
         self.assertEqual("rec_standard", actions[0]["canonical_record_id"])
         self.assertEqual({"rec_legacy"}, deletes["task"])
 
+    def test_legacy_task_progress_moves_to_the_standard_task(self) -> None:
+        records = {key: [] for key in CHILD_SPECS}
+        records["task"] = [
+            {"record_id": "rec_legacy", "fields": {"对应主播": ["rec_anchor"], "任务名称": "主播甲 首次建联", "任务类型": "面试与承接", "工作状态": "已完成", "负责人": "运营甲", "完成情况": "已联系"}},
+            {"record_id": "rec_standard", "fields": {"对应主播": ["rec_anchor"], "任务名称": "主播甲 首次建联", "任务类型": "建联", "工作状态": "未开始", "负责人": "待分配"}},
+        ]
+        updates = {key: {} for key in CHILD_SPECS}
+        deletes = {key: set() for key in CHILD_SPECS}
+
+        actions, protected = plan_duplicate_child_cleanup(records, updates, deletes)
+
+        self.assertEqual([], protected)
+        self.assertEqual("rec_standard", actions[0]["canonical_record_id"])
+        self.assertEqual("已完成", updates["task"]["rec_standard"]["工作状态"])
+        self.assertEqual("运营甲", updates["task"]["rec_standard"]["负责人"])
+        self.assertEqual("已联系", updates["task"]["rec_standard"]["完成情况"])
+        self.assertEqual({"rec_legacy"}, deletes["task"])
+
     def test_duplicate_children_with_progress_on_both_rows_are_protected(self) -> None:
         records = {key: [] for key in CHILD_SPECS}
         records["node"] = [
