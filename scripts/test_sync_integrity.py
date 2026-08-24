@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 import sync_missing_personal_entries as personal
 import sync_missing_workbench_rows as workbench
-from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, find_existing_anchor_for_interview, load_env, personnel_fields_changed, request_json, sync_selected_interview_assignments
+from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, find_existing_anchor_for_interview, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_selected_interview_assignments
 from repair_live_data_integrity import CHILD_SPECS, plan_duplicate_child_cleanup
 
 
@@ -244,6 +244,72 @@ class SyncIntegrityTests(unittest.TestCase):
         report = sync_selected_interview_assignments(fs, [interview])
         self.assertEqual(1, report["updated_records"])
         self.assertEqual([{"id": USER_ID}], fs.updates[0]["fields"]["面试官账号（系统）"])
+
+    def test_manual_anchor_operator_is_canonical_and_moves_default_owned_work(self) -> None:
+        class OwnershipFeishu:
+            def __init__(self) -> None:
+                self.updates = {}
+
+            def list_records(self, table_id, page_size=500):
+                if table_id == TABLES["personnel"]:
+                    return [{"record_id": "rec_person", "fields": {"姓名": "运营乙", "飞书用户": [{"id": "ou_new"}]}}]
+                if table_id == TABLES["anchor"]:
+                    return [{"record_id": "rec_anchor", "fields": {"运营经济人": [{"id": "ou_new", "name": "运营乙"}]}}]
+                rows = {
+                    TABLES["node"]: [{"record_id": "rec_node", "fields": {"关联主播": ["rec_anchor"], "责任人": "运营甲"}}],
+                    TABLES["task"]: [{"record_id": "rec_task", "fields": {"对应主播": ["rec_anchor"], "负责人": "运营甲", "运营经济人": [{"id": "ou_old"}]}}],
+                    TABLES["visual"]: [{"record_id": "rec_visual", "fields": {"关联主播": ["rec_anchor"], "提交运营": [{"id": "ou_specialist"}]}}],
+                    TABLES["training"]: [],
+                    TABLES["first_live"]: [],
+                    TABLES["review"]: [],
+                }
+                return rows.get(table_id, [])
+
+            def batch_update(self, table_id, records, batch_size=100):
+                self.updates.setdefault(table_id, []).extend(records)
+                return [{"code": 0, "data": {"records": records}}]
+
+        fs = OwnershipFeishu()
+        interviews = [{
+            "record_id": "rec_interview",
+            "fields": {
+                "关联主播档案": ["rec_anchor"],
+                "对接运营": "运营甲",
+                "对接运营账号（系统）": [{"id": "ou_old", "name": "运营甲"}],
+            },
+        }]
+
+        report = sync_linked_anchor_operators(fs, interviews)
+
+        self.assertEqual(1, report["operator_reassignments"])
+        self.assertNotIn(TABLES["anchor"], fs.updates)
+        self.assertEqual("运营乙", fs.updates[TABLES["interview"]][0]["fields"]["对接运营"])
+        self.assertEqual([{"id": "ou_new"}], fs.updates[TABLES["interview"]][0]["fields"]["对接运营账号（系统）"])
+        self.assertEqual("运营乙", fs.updates[TABLES["node"]][0]["fields"]["责任人"])
+        self.assertEqual([{"id": "ou_new"}], fs.updates[TABLES["task"]][0]["fields"]["运营经济人"])
+        self.assertNotIn(TABLES["visual"], fs.updates)
+
+    def test_interview_operator_fills_an_unassigned_anchor(self) -> None:
+        class OwnershipFeishu:
+            def __init__(self) -> None:
+                self.updates = {}
+
+            def list_records(self, table_id, page_size=500):
+                if table_id == TABLES["anchor"]:
+                    return [{"record_id": "rec_anchor", "fields": {"运营经济人": []}}]
+                return []
+
+            def batch_update(self, table_id, records, batch_size=100):
+                self.updates.setdefault(table_id, []).extend(records)
+                return [{"code": 0, "data": {"records": records}}]
+
+        fs = OwnershipFeishu()
+        interviews = [{"record_id": "rec_interview", "fields": {"关联主播档案": ["rec_anchor"], "对接运营账号（系统）": [{"id": "ou_new"}]}}]
+
+        report = sync_linked_anchor_operators(fs, interviews)
+
+        self.assertEqual(0, report["operator_reassignments"])
+        self.assertEqual([{"id": "ou_new"}], fs.updates[TABLES["anchor"]][0]["fields"]["运营经济人"])
 
     def test_unchanged_personnel_fields_do_not_trigger_a_write(self) -> None:
         current = {"姓名": "测试员工", "飞书用户": [{"id": USER_ID}], "角色": ["面试官", "招募经纪人"], "是否创建个人入口": True}

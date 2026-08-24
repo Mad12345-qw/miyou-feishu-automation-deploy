@@ -926,13 +926,12 @@ def sync_selected_interview_assignments(fs: Feishu, records: list[dict[str, Any]
 
 
 def sync_linked_anchor_operators(fs: Feishu, records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Keep recruiter, interviewer, and operator ownership aligned on linked anchors."""
+    """Keep ownership aligned without overwriting post-hire operator changes."""
     assignment_fields = {
         "招募人账号（系统）": "招募经济人",
         "面试官账号（系统）": "面试官",
-        "对接运营账号（系统）": "运营经济人",
     }
-    assignments: dict[str, dict[str, list[dict[str, str]]]] = {}
+    assignments: dict[str, tuple[dict[str, Any], dict[str, list[dict[str, str]]]]] = {}
     for record in records:
         fields = record.get("fields") or {}
         linked_ids = linked_record_ids(fields.get("关联主播档案"))
@@ -943,8 +942,7 @@ def sync_linked_anchor_operators(fs: Feishu, records: list[dict[str, Any]]) -> d
             ids = user_ids(fields.get(interview_field))
             if ids:
                 desired[anchor_field] = [{"id": user_id} for user_id in ids]
-        if desired:
-            assignments[linked_ids[0]] = desired
+        assignments[linked_ids[0]] = (record, desired)
 
     anchors_by_id = {
         str(anchor.get("record_id") or ""): anchor
@@ -953,28 +951,131 @@ def sync_linked_anchor_operators(fs: Feishu, records: list[dict[str, Any]]) -> d
     }
     missing_ids = sorted(set(assignments) - set(anchors_by_id))
     updates: list[dict[str, Any]] = []
-    updated_fields = {field_name: 0 for field_name in assignment_fields.values()}
-    for anchor_id, desired in assignments.items():
+    updated_fields = {
+        **{field_name: 0 for field_name in assignment_fields.values()},
+        "运营经济人": 0,
+    }
+    interview_updates: list[dict[str, Any]] = []
+    operator_reassignments: list[dict[str, Any]] = []
+    people_by_id = {
+        user_id: text_value((person.get("fields") or {}).get("姓名")).strip()
+        for person in fs.list_records(TABLES["personnel"], page_size=500)
+        for user_id in user_ids((person.get("fields") or {}).get("飞书用户"))
+    }
+    for anchor_id, (interview, desired) in assignments.items():
         anchor = anchors_by_id.get(anchor_id)
         if not anchor:
             continue
         current = anchor.get("fields") or {}
+        interview_fields = interview.get("fields") or {}
         changed = {
             field_name: users
             for field_name, users in desired.items()
             if set(user_ids(current.get(field_name))) != set(user_ids(users))
         }
+
+        # After a streamer profile exists, reassignment happens on that profile.
+        # The interview is historical input and must not overwrite a later change.
+        anchor_operator = current.get("运营经济人") or []
+        anchor_operator_ids = user_ids(anchor_operator)
+        interview_operator_ids = user_ids(interview_fields.get("对接运营账号（系统）"))
+        if anchor_operator_ids:
+            operator_name = text_value(anchor_operator).strip() or "、".join(
+                people_by_id.get(user_id, "") for user_id in anchor_operator_ids
+            ).strip("、")
+            interview_changed: dict[str, Any] = {}
+            if set(interview_operator_ids) != set(anchor_operator_ids):
+                interview_changed["对接运营账号（系统）"] = [
+                    {"id": user_id} for user_id in anchor_operator_ids
+                ]
+            if operator_name and text_value(interview_fields.get("对接运营")).strip() != operator_name:
+                interview_changed["对接运营"] = operator_name
+            if interview_changed:
+                interview_updates.append(
+                    {"record_id": interview["record_id"], "fields": interview_changed}
+                )
+            if set(interview_operator_ids) != set(anchor_operator_ids):
+                operator_reassignments.append(
+                    {
+                        "anchor_id": anchor_id,
+                        "old_ids": interview_operator_ids,
+                        "old_names": owner_names(interview_fields.get("对接运营"), interview_fields.get("对接运营账号（系统）")),
+                        "new_ids": anchor_operator_ids,
+                        "new_name": operator_name,
+                    }
+                )
+        elif interview_operator_ids:
+            changed["运营经济人"] = [
+                {"id": user_id} for user_id in interview_operator_ids
+            ]
+
         if changed:
             updates.append({"record_id": anchor_id, "fields": changed})
             for field_name in changed:
                 updated_fields[field_name] += 1
+    anchor_results = fs.batch_update(TABLES["anchor"], updates, batch_size=100) if updates else []
+    interview_results = fs.batch_update(TABLES["interview"], interview_updates, batch_size=100) if interview_updates else []
+    dependent_sync = sync_reassigned_anchor_dependents(fs, operator_reassignments)
     return {
         "checked_assignments": len(assignments),
         "updated": len(updates),
         "updated_fields": updated_fields,
+        "updated_interviews": len(interview_updates),
+        "operator_reassignments": len(operator_reassignments),
+        "dependent_sync": dependent_sync,
         "missing_linked_anchor_ids": missing_ids,
-        "results": fs.batch_update(TABLES["anchor"], updates, batch_size=100) if updates else [],
+        "results": anchor_results,
+        "interview_results": interview_results,
     }
+
+
+def sync_reassigned_anchor_dependents(
+    fs: Feishu,
+    reassignments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Move default-owned child work while preserving specialist assignments."""
+    if not reassignments:
+        return {"checked_anchors": 0, "updated": {}}
+
+    by_anchor = {item["anchor_id"]: item for item in reassignments}
+    specs = {
+        "node": ("关联主播", (("责任人", "text"),)),
+        "task": ("对应主播", (("负责人", "text"), ("运营经济人", "user"))),
+        "visual": ("关联主播", (("提交运营", "user"),)),
+        "training": ("关联主播", (("培训运营", "user"),)),
+        "first_live": ("关联主播", (("跟播运营", "user"),)),
+        "review": ("关联主播", (("跟播人员", "user"),)),
+    }
+    counts: dict[str, int] = {}
+    results: dict[str, Any] = {}
+    for table_key, (link_field, owner_fields) in specs.items():
+        updates: list[dict[str, Any]] = []
+        for record in fs.list_records(TABLES[table_key], page_size=500):
+            fields = record.get("fields") or {}
+            linked_ids = linked_record_ids(fields.get(link_field))
+            assignment = next((by_anchor[item] for item in linked_ids if item in by_anchor), None)
+            if not assignment:
+                continue
+            changed: dict[str, Any] = {}
+            old_ids = set(assignment["old_ids"])
+            old_names = set(assignment["old_names"])
+            for field_name, field_kind in owner_fields:
+                current = fields.get(field_name)
+                if field_kind == "user":
+                    current_ids = set(user_ids(current))
+                    if not current_ids or current_ids == old_ids:
+                        changed[field_name] = [
+                            {"id": user_id} for user_id in assignment["new_ids"]
+                        ]
+                else:
+                    current_name = text_value(current).strip()
+                    if not current_name or current_name == "待分配" or current_name in old_names:
+                        changed[field_name] = assignment["new_name"]
+            if changed:
+                updates.append({"record_id": record["record_id"], "fields": changed})
+        counts[table_key] = len(updates)
+        results[table_key] = fs.batch_update(TABLES[table_key], updates, batch_size=100) if updates else []
+    return {"checked_anchors": len(reassignments), "updated": counts, "results": results}
 
 
 def sync_interview_anchor_ownership(fs: Feishu, records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1010,11 +1111,11 @@ def build_anchor_child_payloads(
     interview_fields = interview.get("fields") or {}
     anchor_name = text_value(anchor_fields.get(ANCHOR_NAME_FIELD)).strip()
     anchor_display = anchor_display_name(anchor_fields)
-    owner_users = interview_fields.get("对接运营账号（系统）") or anchor_fields.get("运营经济人") or []
+    owner_users = anchor_fields.get("运营经济人") or interview_fields.get("对接运营账号（系统）") or []
     owner = (
-        text_value(interview_fields.get("对接运营")).strip()
+        text_value(anchor_fields.get("运营经济人")).strip()
         or text_value(owner_users).strip()
-        or text_value(anchor_fields.get("运营经济人")).strip()
+        or text_value(interview_fields.get("对接运营")).strip()
         or "待分配"
     )
 
