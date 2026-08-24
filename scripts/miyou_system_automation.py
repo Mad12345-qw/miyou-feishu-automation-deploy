@@ -1054,7 +1054,7 @@ def sync_reassigned_anchor_dependents(
             fields = record.get("fields") or {}
             linked_ids = linked_record_ids(fields.get(link_field))
             assignment = next((by_anchor[item] for item in linked_ids if item in by_anchor), None)
-            if not assignment:
+            if not assignment or dependent_assignment_is_closed(table_key, fields):
                 continue
             changed: dict[str, Any] = {}
             old_ids = set(assignment["old_ids"])
@@ -1076,6 +1076,27 @@ def sync_reassigned_anchor_dependents(
         counts[table_key] = len(updates)
         results[table_key] = fs.batch_update(TABLES[table_key], updates, batch_size=100) if updates else []
     return {"checked_anchors": len(reassignments), "updated": counts, "results": results}
+
+
+def dependent_assignment_is_closed(table_key: str, fields: dict[str, Any]) -> bool:
+    """Preserve the original owner on completed work for accountability."""
+    if table_key == "node":
+        return (
+            fields.get("实际完成时间") not in (None, "", [], {})
+            or text_value(fields.get("节点状态")).strip() in {"已完成", "已关闭"}
+        )
+    if table_key == "task":
+        return text_value(fields.get("工作状态")).strip() in {"已完成", "已取消", "已关闭"}
+    if table_key == "visual":
+        return (
+            fields.get("完成时间") not in (None, "", [], {})
+            or text_value(fields.get("需求状态")).strip() in {"已完成", "已关闭"}
+        )
+    if table_key == "training":
+        return text_value(fields.get("培训状态")).strip() in {"已完成", "已通过", "未通过"}
+    if table_key == "first_live":
+        return text_value(fields.get("首播状态")).strip() in {"已完成", "已首播", "已结束"}
+    return fields.get("复盘完成时间") not in (None, "", [], {})
 
 
 def sync_interview_anchor_ownership(fs: Feishu, records: list[dict[str, Any]]) -> dict[str, Any]:

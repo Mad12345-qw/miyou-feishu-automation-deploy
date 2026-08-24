@@ -257,7 +257,10 @@ class SyncIntegrityTests(unittest.TestCase):
                     return [{"record_id": "rec_anchor", "fields": {"运营经济人": [{"id": "ou_new", "name": "运营乙"}]}}]
                 rows = {
                     TABLES["node"]: [{"record_id": "rec_node", "fields": {"关联主播": ["rec_anchor"], "责任人": "运营甲"}}],
-                    TABLES["task"]: [{"record_id": "rec_task", "fields": {"对应主播": ["rec_anchor"], "负责人": "运营甲", "运营经济人": [{"id": "ou_old"}]}}],
+                    TABLES["task"]: [
+                        {"record_id": "rec_task", "fields": {"对应主播": ["rec_anchor"], "负责人": "运营甲", "运营经济人": [{"id": "ou_old"}], "工作状态": "进行中"}},
+                        {"record_id": "rec_task_done", "fields": {"对应主播": ["rec_anchor"], "负责人": "运营甲", "运营经济人": [{"id": "ou_old"}], "工作状态": "已完成"}},
+                    ],
                     TABLES["visual"]: [{"record_id": "rec_visual", "fields": {"关联主播": ["rec_anchor"], "提交运营": [{"id": "ou_specialist"}]}}],
                     TABLES["training"]: [],
                     TABLES["first_live"]: [],
@@ -287,6 +290,7 @@ class SyncIntegrityTests(unittest.TestCase):
         self.assertEqual([{"id": "ou_new"}], fs.updates[TABLES["interview"]][0]["fields"]["对接运营账号（系统）"])
         self.assertEqual("运营乙", fs.updates[TABLES["node"]][0]["fields"]["责任人"])
         self.assertEqual([{"id": "ou_new"}], fs.updates[TABLES["task"]][0]["fields"]["运营经济人"])
+        self.assertEqual(["rec_task"], [row["record_id"] for row in fs.updates[TABLES["task"]]])
         self.assertNotIn(TABLES["visual"], fs.updates)
 
     def test_interview_operator_fills_an_unassigned_anchor(self) -> None:
