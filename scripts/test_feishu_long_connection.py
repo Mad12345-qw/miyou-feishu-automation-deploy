@@ -19,6 +19,26 @@ import automation_service as service
 
 
 class FeishuLongConnectionTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        with service.API_QUOTA_STATE_LOCK:
+            service.API_QUOTA_STATE.clear()
+            service.API_QUOTA_STATE.update({"exhausted": False})
+
+    def test_monthly_quota_error_opens_circuit_breaker(self) -> None:
+        error = RuntimeError('HTTP 429: {"code":99991403,"msg":"This month\'s API call quota has been exceeded"}')
+
+        self.assertTrue(service.mark_api_quota_exhausted(error))
+        self.assertFalse(service.api_quota_available())
+        self.assertGreater(service.api_quota_wait_seconds(), 0)
+
+    def test_scheduler_defaults_avoid_minute_full_table_scans(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            intervals = service.scheduler_intervals()
+
+        self.assertEqual(300, intervals["anchor"])
+        self.assertEqual(21600, intervals["personnel"])
+        self.assertEqual(21600, intervals["integrity"])
+        self.assertEqual(86400, intervals["reporting"])
     def test_subscription_is_created_and_verified(self) -> None:
         class FakeFeishu:
             def __init__(self, token: str) -> None:

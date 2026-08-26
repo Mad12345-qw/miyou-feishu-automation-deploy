@@ -29,6 +29,7 @@ FEISHU_EVENT_LOCK = threading.Lock()
 PROVISIONING_STATE_LOCK = threading.Lock()
 ANCHOR_TRANSFER_STATE_LOCK = threading.Lock()
 FEISHU_LONG_CONNECTION_STATE_LOCK = threading.Lock()
+API_QUOTA_STATE_LOCK = threading.Lock()
 FEISHU_RECORD_QUEUE: queue.Queue[tuple[str, str, str]] = queue.Queue()
 FEISHU_PENDING_RECORDS: set[tuple[str, str]] = set()
 FEISHU_PENDING_RECORDS_LOCK = threading.Lock()
@@ -36,6 +37,65 @@ LAST_FEISHU_RECORD_EVENT: dict[str, object] = {"received": False}
 LAST_PERSONNEL_PROVISIONING: dict[str, object] = {"status": "not_run"}
 LAST_ANCHOR_TRANSFER: dict[str, object] = {"status": "not_run"}
 FEISHU_LONG_CONNECTION_STATE: dict[str, object] = {"status": "disabled"}
+API_QUOTA_STATE: dict[str, object] = {"exhausted": False}
+
+
+def is_api_quota_exhausted_error(exc: BaseException) -> bool:
+    message = str(exc)
+    return "99991403" in message or "API call quota has been exceeded" in message
+
+
+def next_month_start(now: datetime | None = None) -> datetime:
+    current = now or datetime.now().astimezone()
+    if current.month == 12:
+        return current.replace(year=current.year + 1, month=1, day=1, hour=0, minute=5, second=0, microsecond=0)
+    return current.replace(month=current.month + 1, day=1, hour=0, minute=5, second=0, microsecond=0)
+
+
+def mark_api_quota_exhausted(exc: BaseException) -> bool:
+    if not is_api_quota_exhausted_error(exc):
+        return False
+    now = datetime.now().astimezone()
+    with API_QUOTA_STATE_LOCK:
+        API_QUOTA_STATE.update(
+            {
+                "exhausted": True,
+                "detected_at": now.isoformat(timespec="seconds"),
+                "resume_after": next_month_start(now).isoformat(timespec="seconds"),
+                "error": str(exc),
+            }
+        )
+    return True
+
+
+def api_quota_available() -> bool:
+    now = datetime.now().astimezone()
+    with API_QUOTA_STATE_LOCK:
+        if not API_QUOTA_STATE.get("exhausted"):
+            return True
+        resume_after = datetime.fromisoformat(str(API_QUOTA_STATE["resume_after"]))
+        if now < resume_after:
+            return False
+        API_QUOTA_STATE.clear()
+        API_QUOTA_STATE.update({"exhausted": False, "resumed_at": now.isoformat(timespec="seconds")})
+        return True
+
+
+def api_quota_wait_seconds() -> int:
+    with API_QUOTA_STATE_LOCK:
+        if not API_QUOTA_STATE.get("exhausted"):
+            return 0
+        resume_after = datetime.fromisoformat(str(API_QUOTA_STATE["resume_after"]))
+    return max(1, min(300, int((resume_after - datetime.now().astimezone()).total_seconds())))
+
+
+def scheduler_intervals() -> dict[str, int]:
+    return {
+        "anchor": max(300, int(os.environ.get("ANCHOR_TRANSFER_INTERVAL_SECONDS", "300"))),
+        "personnel": max(3600, int(os.environ.get("PERSONNEL_ENTRY_INTERVAL_SECONDS", "21600"))),
+        "integrity": max(3600, int(os.environ.get("INTERVIEW_INTEGRITY_INTERVAL_SECONDS", "21600"))),
+        "reporting": max(21600, int(os.environ.get("REPORTING_INTERVAL_SECONDS", "86400"))),
+    }
 
 
 def tenant_token() -> str:
@@ -296,7 +356,7 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
 
 def trigger_anchor_transfer_async(reason: str) -> bool:
     """Wake a self-healing cycle without delaying health checks or Feishu callbacks."""
-    if not service_enabled() or ANCHOR_TRANSFER_LOCK.locked():
+    if not service_enabled() or not api_quota_available() or ANCHOR_TRANSFER_LOCK.locked():
         return False
 
     def run() -> None:
@@ -359,24 +419,29 @@ def background_scheduler() -> None:
         if initial_delay > 0:
             time.sleep(initial_delay)
         while True:
+            quota_wait = api_quota_wait_seconds()
+            if quota_wait:
+                time.sleep(quota_wait)
+                continue
             if enabled():
                 try:
                     action()
                 except Exception as exc:
-                    app.logger.exception("%s failed: %s", name, exc)
+                    if mark_api_quota_exhausted(exc):
+                        app.logger.error("%s paused because the monthly Feishu API quota is exhausted.", name)
+                    else:
+                        app.logger.exception("%s failed: %s", name, exc)
             time.sleep(interval)
 
-    # Keep employee entries and ownership routing responsive without relying on
-    # a user to re-enter the same assignment in a second table.
-    base_interval = max(60, int(os.environ.get("AUTOMATION_INTERVAL_SECONDS", "60")))
+    intervals = scheduler_intervals()
     workers = [
-        ("Anchor transfer sync", max(60, min(base_interval, 180)), 0, service_enabled, run_anchor_transfer_cycle),
-        ("Personnel entry sync", max(60, min(base_interval, 180)), 30, personnel_dropdown_sync_enabled, run_personnel_entry_cycle),
-        ("Interview integrity sync", base_interval, 60, personnel_dropdown_sync_enabled, run_interview_integrity_cycle),
-        ("Reporting sync", max(300, base_interval * 3), 90, lambda: service_enabled() and reporting_sync_enabled(), run_reporting_cycle),
+        ("Anchor transfer sync", intervals["anchor"], 0, service_enabled, run_anchor_transfer_cycle),
+        ("Personnel entry sync", intervals["personnel"], 60, personnel_dropdown_sync_enabled, run_personnel_entry_cycle),
+        ("Interview integrity sync", intervals["integrity"], 120, personnel_dropdown_sync_enabled, run_interview_integrity_cycle),
+        ("Reporting sync", intervals["reporting"], 180, lambda: service_enabled() and reporting_sync_enabled(), run_reporting_cycle),
     ]
     if mobile_form_configured():
-        workers.insert(0, ("Mobile form entry sync", base_interval, 10, lambda: True, sync_mobile_form_entry))
+        workers.insert(0, ("Mobile form entry sync", intervals["personnel"], 10, lambda: True, sync_mobile_form_entry))
     for name, interval, initial_delay, enabled, action in workers:
         threading.Thread(target=worker, args=(name, interval, initial_delay, enabled, action), daemon=True, name=name).start()
     while True:
@@ -452,6 +517,9 @@ def feishu_record_worker() -> None:
                     record_id,
                 )
                 continue
+            if not api_quota_available():
+                app.logger.info("Deferred Feishu interview event for %s until the monthly API quota resets.", record_id)
+                continue
             fs = Feishu(tenant_token())
             result = sync_one_interview_personnel_assignment(fs, record_id, Path("runtime"))
             app.logger.info(
@@ -462,7 +530,10 @@ def feishu_record_worker() -> None:
             )
             trigger_anchor_transfer_async(f"Feishu interview event via {transport}")
         except Exception as exc:
-            app.logger.exception("Feishu record event processing failed for %s: %s", record_id, exc)
+            if mark_api_quota_exhausted(exc):
+                app.logger.error("Feishu record event processing paused because the monthly API quota is exhausted.")
+            else:
+                app.logger.exception("Feishu record event processing failed for %s: %s", record_id, exc)
         finally:
             with FEISHU_PENDING_RECORDS_LOCK:
                 FEISHU_PENDING_RECORDS.discard((table_id, record_id))
@@ -497,6 +568,10 @@ def run_feishu_long_connection() -> None:
     import lark_oapi as lark
 
     while True:
+        quota_wait = api_quota_wait_seconds()
+        if quota_wait:
+            time.sleep(quota_wait)
+            continue
         try:
             with FEISHU_LONG_CONNECTION_STATE_LOCK:
                 FEISHU_LONG_CONNECTION_STATE.update(
@@ -538,8 +613,12 @@ def run_feishu_long_connection() -> None:
                         "error": str(exc),
                     }
                 )
-            app.logger.exception("Feishu long connection failed: %s", exc)
-            time.sleep(15)
+            if mark_api_quota_exhausted(exc):
+                app.logger.error("Feishu long connection paused because the monthly API quota is exhausted.")
+                time.sleep(api_quota_wait_seconds())
+            else:
+                app.logger.exception("Feishu long connection failed: %s", exc)
+                time.sleep(15)
 
 
 @app.get("/health")
@@ -552,12 +631,17 @@ def health() -> object:
         last_anchor_transfer = dict(LAST_ANCHOR_TRANSFER)
     with FEISHU_LONG_CONNECTION_STATE_LOCK:
         long_connection = dict(FEISHU_LONG_CONNECTION_STATE)
+    quota_available = api_quota_available()
+    with API_QUOTA_STATE_LOCK:
+        api_quota = dict(API_QUOTA_STATE)
     anchor_transfer_wake_requested = False
-    if last_anchor_transfer.get("status") in {"not_run", "failed"}:
+    if quota_available and last_anchor_transfer.get("status") in {"not_run", "failed"}:
         anchor_transfer_wake_requested = trigger_anchor_transfer_async("health wake")
     return jsonify(
         {
             "ok": True,
+            "automation_operational": service_enabled() and quota_available,
+            "api_quota": api_quota,
             "automation_enabled": os.environ.get("AUTOMATION_ENABLED", "false").lower() == "true",
             "calendar_sync_enabled": calendar_sync_enabled(),
             "local_scheduler_enabled": os.environ.get("LOCAL_SCHEDULER_ENABLED", "false").lower() == "true",
@@ -576,7 +660,7 @@ def health() -> object:
             "last_personnel_provisioning": last_provisioning,
             "last_anchor_transfer": last_anchor_transfer,
             "anchor_transfer_wake_requested": anchor_transfer_wake_requested,
-            "schema_version": "2026-08-22-single-server-long-connection-v11",
+            "schema_version": "2026-08-26-quota-circuit-breaker-v12",
             "active_batch": os.environ.get("AUTOMATION_ACTIVE_BATCH", ""),
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
