@@ -146,7 +146,8 @@ def request_json(method: str, url: str, headers: dict[str, str] | None = None, b
             except json.JSONDecodeError:
                 error_payload = {}
             error_code = error_payload.get("code")
-            rate_limited = error_code == 99991400 or exc.code == 429
+            quota_exhausted = error_code == 99991403
+            rate_limited = not quota_exhausted and (error_code == 99991400 or exc.code == 429)
             retryable = rate_limited or error_code in {1254607, 2200} or exc.code >= 500
             retry_limit = 7 if rate_limited else 4
             if retryable and attempt < retry_limit:

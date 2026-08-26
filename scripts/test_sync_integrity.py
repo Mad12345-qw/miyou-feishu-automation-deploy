@@ -211,6 +211,27 @@ class SyncIntegrityTests(unittest.TestCase):
         self.assertEqual(2, calls)
         sleep.assert_called_once_with(2.0)
 
+    def test_monthly_quota_exhaustion_is_not_retried(self) -> None:
+        calls = 0
+
+        def open_url(_request, timeout):
+            nonlocal calls
+            self.assertEqual(90, timeout)
+            calls += 1
+            raise HTTPError(
+                "https://open.feishu.cn/test",
+                429,
+                "Too Many Requests",
+                {},
+                BytesIO(b'{"code":99991403,"msg":"This month quota has been exceeded"}'),
+            )
+
+        with patch("miyou_system_automation.urllib.request.urlopen", side_effect=open_url):
+            with self.assertRaisesRegex(RuntimeError, "99991403"):
+                request_json("GET", "https://open.feishu.cn/test")
+
+        self.assertEqual(1, calls)
+
     def test_env_loader_removes_systemd_style_quotes(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "service.env"
