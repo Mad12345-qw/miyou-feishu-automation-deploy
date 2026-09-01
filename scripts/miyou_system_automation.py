@@ -3164,14 +3164,28 @@ def ensure_management_summary_table(fs: Feishu) -> tuple[str, str]:
 def sync_management_summary(fs: Feishu, out_dir: Path) -> dict[str, Any]:
     table_id, view_id = ensure_management_summary_table(fs)
     personnel = fs.list_records(TABLES["personnel"], page_size=500)
-    user_names = {
-        user_id: text_value((record.get("fields") or {}).get("姓名"))
-        for record in personnel
-        for user_id in user_ids((record.get("fields") or {}).get("飞书用户"))
+    user_names: dict[str, str] = {}
+    alias_candidates: dict[str, set[str]] = defaultdict(set)
+    for record in personnel:
+        fields = record.get("fields") or {}
+        name = text_value(fields.get("姓名")).strip()
+        account_ids = user_ids(fields.get("飞书用户"))
+        aliases = normalized_owner_names(name, fields.get("匹配别名"))
+        for user_id in account_ids:
+            user_names[user_id] = name
+            for alias in aliases:
+                alias_candidates[alias].add(user_id)
+    alias_user_ids = {
+        alias: next(iter(account_ids))
+        for alias, account_ids in alias_candidates.items()
+        if len(account_ids) == 1
     }
     groups: dict[str, dict[str, Any]] = {}
 
     def group_for(user_id: str, fallback_name: str) -> dict[str, Any]:
+        fallback_name = fallback_name.strip()
+        if not user_id:
+            user_id = alias_user_ids.get(fallback_name, "")
         key = user_id or fallback_name or "待分配"
         name = user_names.get(user_id) or fallback_name or "待分配"
         if key not in groups:
@@ -3232,7 +3246,10 @@ def sync_management_summary(fs: Feishu, out_dir: Path) -> dict[str, Any]:
     desired.sort(key=lambda item: (-item["负责主播数"], item["运营人员"]))
 
     existing = fs.list_records(table_id, page_size=500)
-    existing_by_name = {text_value((record.get("fields") or {}).get("运营人员")): record for record in existing}
+    existing_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in existing:
+        existing_groups[text_value((record.get("fields") or {}).get("运营人员"))].append(record)
+    existing_by_name = {name: records[0] for name, records in existing_groups.items()}
     creates = [{"fields": fields} for fields in desired if fields["运营人员"] not in existing_by_name]
     updates = [
         {"record_id": existing_by_name[fields["运营人员"]]["record_id"], "fields": fields}
@@ -3242,7 +3259,11 @@ def sync_management_summary(fs: Feishu, out_dir: Path) -> dict[str, Any]:
     create_results = fs.batch_create(table_id, creates, batch_size=500) if creates else []
     update_results = fs.batch_update(table_id, updates, batch_size=500) if updates else []
     desired_names = {fields["运营人员"] for fields in desired}
-    stale_records = [record for name, record in existing_by_name.items() if name not in desired_names]
+    stale_records = [
+        record
+        for name, records in existing_groups.items()
+        for record in (records if name not in desired_names else records[1:])
+    ]
     delete_results = [
         fs.api("DELETE", f"/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/records/{record['record_id']}")
         for record in stale_records

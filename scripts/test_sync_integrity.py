@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 import sync_missing_personal_entries as personal
 import sync_missing_workbench_rows as workbench
-from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, find_existing_anchor_for_interview, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_selected_interview_assignments
+from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, find_existing_anchor_for_interview, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_management_summary, sync_selected_interview_assignments
 from repair_live_data_integrity import CHILD_SPECS, plan_duplicate_child_cleanup
 
 
@@ -422,6 +422,72 @@ class SyncIntegrityTests(unittest.TestCase):
         self.assertEqual(1, report["planned_hidden"])
         self.assertEqual(1, report["hidden"])
         self.assertEqual(["rec_stale"], fs.deletes)
+
+    def test_management_summary_groups_verified_aliases_by_user(self) -> None:
+        class SummaryFeishu:
+            def __init__(self) -> None:
+                self.created = []
+                self.updated = []
+                self.deleted = []
+
+            def list_records(self, table_id: str, page_size: int = 500):
+                if table_id == TABLES["personnel"]:
+                    return [
+                        {
+                            "record_id": "rec_person",
+                            "fields": {
+                                "姓名": "马丽源",
+                                "匹配别名": "源源",
+                                "飞书用户": [{"id": "ou_operator"}],
+                            },
+                        }
+                    ]
+                if table_id == TABLES["anchor"]:
+                    return [
+                        {
+                            "record_id": "rec_anchor",
+                            "fields": {
+                                "运营经济人": [{"id": "ou_operator"}],
+                                "主阶段": "待建联",
+                            },
+                        }
+                    ]
+                if table_id == TABLES["task"]:
+                    return [
+                        {"record_id": "rec_task_1", "fields": {"运营经济人": [{"id": "ou_operator"}], "负责人": "马丽源", "工作状态": "未开始"}},
+                        {"record_id": "rec_task_2", "fields": {"运营经济人": [], "负责人": "源源", "工作状态": "未开始"}},
+                    ]
+                if table_id == "tbl_summary":
+                    return [
+                        {"record_id": "rec_summary_keep", "fields": {"运营人员": "马丽源"}},
+                        {"record_id": "rec_summary_duplicate", "fields": {"运营人员": "马丽源"}},
+                    ]
+                return []
+
+            def batch_create(self, table_id: str, records, batch_size: int = 500):
+                self.created.extend(records)
+                return [{"code": 0, "data": {"records": records}}]
+
+            def batch_update(self, table_id: str, records, batch_size: int = 500):
+                self.updated.extend(records)
+                return [{"code": 0, "data": {"records": records}}]
+
+            def api(self, method: str, path: str, query=None, body=None):
+                if method == "DELETE":
+                    self.deleted.append(path.rsplit("/", 1)[-1])
+                    return {"code": 0}
+                raise AssertionError((method, path, query, body))
+
+        fs = SummaryFeishu()
+        with TemporaryDirectory() as tmp, patch("miyou_system_automation.ensure_management_summary_table", return_value=("tbl_summary", "vew_summary")):
+            report = sync_management_summary(fs, Path(tmp))
+
+        self.assertEqual(1, report["rows"])
+        self.assertEqual([], fs.created)
+        self.assertEqual("马丽源", fs.updated[0]["fields"]["运营人员"])
+        self.assertEqual([{"id": "ou_operator"}], fs.updated[0]["fields"]["运营账号"])
+        self.assertEqual(2, fs.updated[0]["fields"]["未完成任务数"])
+        self.assertEqual(["rec_summary_duplicate"], fs.deleted)
 
 
 if __name__ == "__main__":
