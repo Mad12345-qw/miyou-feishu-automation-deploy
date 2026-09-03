@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -123,7 +124,24 @@ def load_env(path: Path) -> dict[str, str]:
 
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(payload)
+            temp_path = Path(handle.name)
+        os.chmod(temp_path, 0o644)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
 
 
 def request_json(method: str, url: str, headers: dict[str, str] | None = None, body: Any | None = None) -> dict[str, Any]:
@@ -924,6 +942,22 @@ def sync_selected_interview_assignments(fs: Feishu, records: list[dict[str, Any]
         if changed:
             updates.append({"record_id": record["record_id"], "fields": changed})
     return {"updated_records": len(updates), "unresolved_values": sorted(unresolved), "results": fs.batch_update(TABLES["interview"], updates, batch_size=100) if updates else []}
+
+
+def sync_recent_interview_assignments(fs: Feishu, limit: int = 500) -> dict[str, Any]:
+    """Repair recently edited interview owners without a full-table scan."""
+    page_size = max(1, min(500, limit))
+    response = fs.api(
+        "POST",
+        f"/bitable/v1/apps/{APP_TOKEN}/tables/{TABLES['interview']}/records/search",
+        query={"page_size": page_size},
+        body={"sort": [{"field_name": SYSTEM_MODIFIED_AT_FIELD, "desc": True}]},
+    )
+    if response.get("code") != 0:
+        raise RuntimeError(f"Unable to read recently changed interviews: {response}")
+    records = ((response.get("data") or {}).get("items") or [])[:page_size]
+    result = sync_selected_interview_assignments(fs, records)
+    return {"scanned_records": len(records), **result}
 
 
 def sync_linked_anchor_operators(fs: Feishu, records: list[dict[str, Any]]) -> dict[str, Any]:

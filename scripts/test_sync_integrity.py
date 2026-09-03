@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 import sync_missing_personal_entries as personal
 import sync_missing_workbench_rows as workbench
-from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, find_existing_anchor_for_interview, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_management_summary, sync_selected_interview_assignments
+from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, find_existing_anchor_for_interview, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_management_summary, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
 from repair_live_data_integrity import CHILD_SPECS, plan_duplicate_child_cleanup
 
 
@@ -104,6 +104,65 @@ class FakeFeishu:
 
 
 class SyncIntegrityTests(unittest.TestCase):
+    def test_write_json_replaces_existing_result(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "result.json"
+            path.write_text('{"old": true}', encoding="utf-8")
+
+            write_json(path, {"new": True})
+
+            self.assertEqual('{\n  "new": true\n}', path.read_text(encoding="utf-8"))
+
+    def test_recent_assignment_sync_reads_only_one_sorted_page(self) -> None:
+        class RecentFake:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def api(self, method, path, query=None, body=None):
+                self.calls.append((method, path, query, body))
+                return {
+                    "code": 0,
+                    "data": {
+                        "items": [
+                            {
+                                "record_id": "rec_recent",
+                                "fields": {
+                                    "招募人": "测试员工",
+                                    "招募人账号（系统）": [],
+                                },
+                            }
+                        ]
+                    },
+                }
+
+            def list_records(self, table_id, page_size=500):
+                self.assert_personnel_table = table_id
+                return [
+                    {
+                        "record_id": "rec_person",
+                        "fields": {
+                            "姓名": "测试员工",
+                            "飞书用户": [{"id": USER_ID}],
+                            "在职状态": "在职",
+                            "账号状态": "正常",
+                        },
+                    }
+                ]
+
+            def batch_update(self, table_id, records, batch_size=500):
+                self.updated = records
+                return [{"code": 0}]
+
+        fs = RecentFake()
+
+        result = sync_recent_interview_assignments(fs, limit=100)
+
+        self.assertEqual(1, result["scanned_records"])
+        self.assertEqual(1, result["updated_records"])
+        self.assertEqual({"page_size": 100}, fs.calls[0][2])
+        self.assertEqual("系统：最后修改时间", fs.calls[0][3]["sort"][0]["field_name"])
+        self.assertEqual([{"record_id": "rec_recent", "fields": {"招募人账号（系统）": [{"id": USER_ID}]}}], fs.updated)
+
     def test_batch_delete_uses_feishu_batch_endpoint(self) -> None:
         fs = Feishu("token")
         calls = []

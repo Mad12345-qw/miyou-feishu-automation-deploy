@@ -11,7 +11,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 
 from mobile_interview_form import register_mobile_interview_form
-from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_interview_display_fields, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory
+from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_interview_display_fields, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory, sync_recent_interview_assignments
 from run_miyou_rule_engine import reconcile
 from sync_missing_personal_entries import sync_missing_personal_entries
 from sync_missing_workbench_rows import sync_missing_workbench_rows
@@ -300,6 +300,10 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
         batch = f"LIVE-{datetime.now().strftime('%Y%m%d')}"
         fs = Feishu(tenant_token())
         out_dir = Path("runtime")
+        recent_assignments = sync_recent_interview_assignments(
+            fs,
+            limit=max(1, int(os.environ.get("RECENT_INTERVIEW_ASSIGNMENT_LIMIT", "500"))),
+        )
         build = build_chain(
             fs,
             batch,
@@ -315,7 +319,13 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
             maintenance_reason = "Anchor maintenance sync is disabled."
             photos = {"skipped": True, "reason": maintenance_reason}
             anchor_displays = {"skipped": True, "reason": maintenance_reason}
-        result = {"batch": batch, "build": build, "photos": photos, "anchor_displays": anchor_displays}
+        result = {
+            "batch": batch,
+            "recent_assignments": recent_assignments,
+            "build": build,
+            "photos": photos,
+            "anchor_displays": anchor_displays,
+        }
         finished_at = datetime.now().astimezone()
         with ANCHOR_TRANSFER_STATE_LOCK:
             LAST_ANCHOR_TRANSFER.update(
@@ -331,6 +341,9 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
                     "updated_recruiter_assignments": ((build.get("anchor_operator_sync") or {}).get("updated_fields") or {}).get("招募经济人", 0),
                     "updated_interviewer_assignments": ((build.get("anchor_operator_sync") or {}).get("updated_fields") or {}).get("面试官", 0),
                     "updated_operator_assignments": ((build.get("anchor_operator_sync") or {}).get("updated_fields") or {}).get("运营经济人", 0),
+                    "recent_assignment_records": recent_assignments.get("scanned_records", 0),
+                    "recent_assignment_updates": recent_assignments.get("updated_records", 0),
+                    "recent_assignment_unresolved": len(recent_assignments.get("unresolved_values") or []),
                     "missing_linked_anchors": len((build.get("anchor_operator_sync") or {}).get("missing_linked_anchor_ids") or []),
                     "unresolved_people": len((build.get("assignment_sync") or {}).get("unresolved_values") or []),
                     "error": "",
