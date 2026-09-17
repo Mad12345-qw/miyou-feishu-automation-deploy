@@ -36,6 +36,7 @@ class FeishuLongConnectionTests(unittest.TestCase):
             intervals = service.scheduler_intervals()
 
         self.assertEqual(300, intervals["anchor"])
+        self.assertEqual(3600, intervals["personnel_probe"])
         self.assertEqual(21600, intervals["personnel"])
         self.assertEqual(21600, intervals["integrity"])
         self.assertEqual(86400, intervals["reporting"])
@@ -99,6 +100,23 @@ class FeishuLongConnectionTests(unittest.TestCase):
         result = service.handle_long_connection_contact_event(data)
 
         self.assertTrue(result["queued"])
+        self.assertTrue(service.PERSONNEL_WAKE_EVENT.is_set())
+        service.PERSONNEL_WAKE_EVENT.clear()
+
+    def test_personnel_probe_only_wakes_on_directory_change(self) -> None:
+        service.PERSONNEL_WAKE_EVENT.clear()
+        with (
+            patch.object(service, "tenant_token", return_value="tenant-token"),
+            patch.object(service, "Feishu", return_value=object()),
+            patch.object(
+                service,
+                "sync_personnel_directory",
+                return_value={"created": 1, "updated": 0, "deactivated": 0},
+            ),
+        ):
+            result = service.run_personnel_probe_cycle()
+
+        self.assertEqual(1, result["changed"])
         self.assertTrue(service.PERSONNEL_WAKE_EVENT.is_set())
         service.PERSONNEL_WAKE_EVENT.clear()
 

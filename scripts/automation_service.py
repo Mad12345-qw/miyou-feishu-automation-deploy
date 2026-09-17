@@ -94,6 +94,7 @@ def api_quota_wait_seconds() -> int:
 def scheduler_intervals() -> dict[str, int]:
     return {
         "anchor": max(300, int(os.environ.get("ANCHOR_TRANSFER_INTERVAL_SECONDS", "300"))),
+        "personnel_probe": max(900, int(os.environ.get("PERSONNEL_PROBE_INTERVAL_SECONDS", "3600"))),
         "personnel": max(3600, int(os.environ.get("PERSONNEL_ENTRY_INTERVAL_SECONDS", "21600"))),
         "integrity": max(3600, int(os.environ.get("INTERVIEW_INTEGRITY_INTERVAL_SECONDS", "21600"))),
         "reporting": max(21600, int(os.environ.get("REPORTING_INTERVAL_SECONDS", "86400"))),
@@ -192,6 +193,25 @@ def run_personnel_dropdown_cycle() -> dict[str, object]:
     surface = ensure_interview_workflow_surface(fs, out_dir)
     dropdowns = sync_interview_personnel_dropdowns(fs, out_dir)
     return {"personnel": personnel, "dropdowns": dropdowns, "surface": surface}
+
+
+def run_personnel_probe_cycle(wait_for_scan_seconds: float = 30) -> dict[str, object]:
+    """Poll the directory cheaply and wake full provisioning only on a change."""
+    if not PERSONNEL_ENTRY_LOCK.acquire(blocking=False):
+        return {"skipped": True, "reason": "Personnel entry sync is already running."}
+    acquired_scan = FEISHU_SCAN_LOCK.acquire(timeout=max(0.0, wait_for_scan_seconds))
+    if not acquired_scan:
+        PERSONNEL_ENTRY_LOCK.release()
+        return {"skipped": True, "reason": "Another Feishu full scan is already running."}
+    try:
+        personnel = sync_personnel_directory(Feishu(tenant_token()), Path("runtime"))
+        changed = sum(int(personnel.get(key) or 0) for key in ("created", "updated", "deactivated"))
+        if changed:
+            PERSONNEL_WAKE_EVENT.set()
+        return {"changed": changed, "personnel": personnel}
+    finally:
+        FEISHU_SCAN_LOCK.release()
+        PERSONNEL_ENTRY_LOCK.release()
 
 
 def run_personnel_entry_cycle(wait_for_scan_seconds: float = 0) -> dict[str, object]:
@@ -478,6 +498,13 @@ def background_scheduler() -> None:
     intervals = scheduler_intervals()
     workers = [
         ("Anchor transfer sync", intervals["anchor"], 0, service_enabled, run_anchor_transfer_cycle),
+        (
+            "Personnel directory probe",
+            intervals["personnel_probe"],
+            300,
+            personnel_dropdown_sync_enabled,
+            run_personnel_probe_cycle,
+        ),
         (
             "Personnel entry sync",
             intervals["personnel"],
