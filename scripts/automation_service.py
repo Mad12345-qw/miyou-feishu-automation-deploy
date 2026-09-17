@@ -34,10 +34,12 @@ FEISHU_RECORD_QUEUE: queue.Queue[tuple[str, str, str]] = queue.Queue()
 FEISHU_PENDING_RECORDS: set[tuple[str, str]] = set()
 FEISHU_PENDING_RECORDS_LOCK = threading.Lock()
 LAST_FEISHU_RECORD_EVENT: dict[str, object] = {"received": False}
+LAST_FEISHU_CONTACT_EVENT: dict[str, object] = {"received": False}
 LAST_PERSONNEL_PROVISIONING: dict[str, object] = {"status": "not_run"}
 LAST_ANCHOR_TRANSFER: dict[str, object] = {"status": "not_run"}
 FEISHU_LONG_CONNECTION_STATE: dict[str, object] = {"status": "disabled"}
 API_QUOTA_STATE: dict[str, object] = {"exhausted": False}
+PERSONNEL_WAKE_EVENT = threading.Event()
 
 
 def is_api_quota_exhausted_error(exc: BaseException) -> bool:
@@ -192,11 +194,16 @@ def run_personnel_dropdown_cycle() -> dict[str, object]:
     return {"personnel": personnel, "dropdowns": dropdowns, "surface": surface}
 
 
-def run_personnel_entry_cycle() -> dict[str, object]:
+def run_personnel_entry_cycle(wait_for_scan_seconds: float = 0) -> dict[str, object]:
     """Keep new employee entry creation independent from heavy business jobs."""
     if not PERSONNEL_ENTRY_LOCK.acquire(blocking=False):
         return {"skipped": True, "reason": "Personnel entry sync is already running."}
-    if not FEISHU_SCAN_LOCK.acquire(blocking=False):
+    acquired_scan = (
+        FEISHU_SCAN_LOCK.acquire(timeout=max(0.0, wait_for_scan_seconds))
+        if wait_for_scan_seconds > 0
+        else FEISHU_SCAN_LOCK.acquire(blocking=False)
+    )
+    if not acquired_scan:
         PERSONNEL_ENTRY_LOCK.release()
         return {"skipped": True, "reason": "Another Feishu full scan is already running."}
     try:
@@ -214,7 +221,11 @@ def run_personnel_entry_cycle() -> dict[str, object]:
             surface = ensure_interview_workflow_surface(fs, out_dir)
             dropdowns = sync_interview_personnel_dropdowns(fs, out_dir, sync_records=False)
             personal_views = sync_missing_personal_entries(fs, out_dir)
-            personal_workbench = sync_missing_workbench_rows(fs, out_dir)
+            personal_workbench = sync_missing_workbench_rows(
+                fs,
+                out_dir,
+                preloaded_views=personal_views["view_sync"].get("views"),
+            )
             business_failures = len(personal_views["view_sync"]["failed"])
             workbench_view_failures = len(personal_views["workbench_view_sync"]["failed"])
             workbench_row_failures = (
@@ -428,35 +439,67 @@ def run_live_cycle() -> dict[str, object]:
 
 
 def background_scheduler() -> None:
-    def worker(name: str, interval: int, initial_delay: int, enabled: callable, action: callable) -> None:
+    def worker(
+        name: str,
+        interval: int,
+        initial_delay: int,
+        enabled: callable,
+        action: callable,
+        wake_event: threading.Event | None = None,
+    ) -> None:
         if initial_delay > 0:
-            time.sleep(initial_delay)
+            if wake_event:
+                wake_event.wait(initial_delay)
+                wake_event.clear()
+            else:
+                time.sleep(initial_delay)
         while True:
+            wait_seconds = interval
             quota_wait = api_quota_wait_seconds()
             if quota_wait:
                 time.sleep(quota_wait)
                 continue
             if enabled():
                 try:
-                    action()
+                    result = action()
+                    if isinstance(result, dict) and result.get("skipped"):
+                        wait_seconds = min(15, interval)
                 except Exception as exc:
                     if mark_api_quota_exhausted(exc):
                         app.logger.error("%s paused because the monthly Feishu API quota is exhausted.", name)
                     else:
                         app.logger.exception("%s failed: %s", name, exc)
-            time.sleep(interval)
+            if wake_event:
+                wake_event.wait(wait_seconds)
+                wake_event.clear()
+            else:
+                time.sleep(wait_seconds)
 
     intervals = scheduler_intervals()
     workers = [
         ("Anchor transfer sync", intervals["anchor"], 0, service_enabled, run_anchor_transfer_cycle),
-        ("Personnel entry sync", intervals["personnel"], 60, personnel_dropdown_sync_enabled, run_personnel_entry_cycle),
+        (
+            "Personnel entry sync",
+            intervals["personnel"],
+            60,
+            personnel_dropdown_sync_enabled,
+            lambda: run_personnel_entry_cycle(wait_for_scan_seconds=120),
+            PERSONNEL_WAKE_EVENT,
+        ),
         ("Interview integrity sync", intervals["integrity"], 120, personnel_dropdown_sync_enabled, run_interview_integrity_cycle),
         ("Reporting sync", intervals["reporting"], 180, lambda: service_enabled() and reporting_sync_enabled(), run_reporting_cycle),
     ]
     if mobile_form_configured():
         workers.insert(0, ("Mobile form entry sync", intervals["personnel"], 10, lambda: True, sync_mobile_form_entry))
-    for name, interval, initial_delay, enabled, action in workers:
-        threading.Thread(target=worker, args=(name, interval, initial_delay, enabled, action), daemon=True, name=name).start()
+    for item in workers:
+        name, interval, initial_delay, enabled, action, *optional = item
+        wake_event = optional[0] if optional else None
+        threading.Thread(
+            target=worker,
+            args=(name, interval, initial_delay, enabled, action, wake_event),
+            daemon=True,
+            name=name,
+        ).start()
     while True:
         time.sleep(3600)
 
@@ -471,6 +514,23 @@ def note_feishu_record_event(event_type: str, table_kind: str) -> None:
                 "time": datetime.now().astimezone().isoformat(timespec="seconds"),
             }
         )
+
+
+def handle_long_connection_contact_event(data: object) -> dict[str, object]:
+    """Wake employee provisioning when the Feishu directory changes."""
+    header = getattr(data, "header", None)
+    event_type = str(getattr(header, "event_type", "") or "contact.user.changed_v3")
+    with FEISHU_EVENT_LOCK:
+        LAST_FEISHU_CONTACT_EVENT.clear()
+        LAST_FEISHU_CONTACT_EVENT.update(
+            {
+                "received": True,
+                "event_type": event_type,
+                "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+        )
+    PERSONNEL_WAKE_EVENT.set()
+    return {"queued": True, "event_type": event_type}
 
 
 def enqueue_feishu_record_changes(
@@ -598,6 +658,9 @@ def run_feishu_long_connection() -> None:
             event_handler = (
                 lark.EventDispatcherHandler.builder("", "")
                 .register_p2_drive_file_bitable_record_changed_v1(handle_long_connection_record_event)
+                .register_p2_contact_user_created_v3(handle_long_connection_contact_event)
+                .register_p2_contact_user_updated_v3(handle_long_connection_contact_event)
+                .register_p2_contact_user_deleted_v3(handle_long_connection_contact_event)
                 .build()
             )
             client = lark.ws.Client(
@@ -638,6 +701,7 @@ def run_feishu_long_connection() -> None:
 def health() -> object:
     with FEISHU_EVENT_LOCK:
         last_event = dict(LAST_FEISHU_RECORD_EVENT)
+        last_contact_event = dict(LAST_FEISHU_CONTACT_EVENT)
     with PROVISIONING_STATE_LOCK:
         last_provisioning = dict(LAST_PERSONNEL_PROVISIONING)
     with ANCHOR_TRANSFER_STATE_LOCK:
@@ -670,10 +734,13 @@ def health() -> object:
             "feishu_record_event_queue_size": FEISHU_RECORD_QUEUE.qsize(),
             "feishu_record_event_callback_ready": True,
             "last_feishu_record_event": last_event,
+            "last_feishu_contact_event": last_contact_event,
+            "personnel_contact_event_handlers_registered": True,
+            "personnel_wake_pending": PERSONNEL_WAKE_EVENT.is_set(),
             "last_personnel_provisioning": last_provisioning,
             "last_anchor_transfer": last_anchor_transfer,
             "anchor_transfer_wake_requested": anchor_transfer_wake_requested,
-            "schema_version": "2026-08-26-quota-circuit-breaker-v12",
+            "schema_version": "2026-09-17-event-driven-personnel-v13",
             "active_batch": os.environ.get("AUTOMATION_ACTIVE_BATCH", ""),
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
         }

@@ -92,6 +92,16 @@ class FeishuLongConnectionTests(unittest.TestCase):
         self.assertEqual(0, result["queued"])
         self.assertEqual("other_app", result["ignored"])
 
+    def test_contact_event_wakes_personnel_provisioning(self) -> None:
+        data = SimpleNamespace(header=SimpleNamespace(event_type="contact.user.created_v3"))
+        service.PERSONNEL_WAKE_EVENT.clear()
+
+        result = service.handle_long_connection_contact_event(data)
+
+        self.assertTrue(result["queued"])
+        self.assertTrue(service.PERSONNEL_WAKE_EVENT.is_set())
+        service.PERSONNEL_WAKE_EVENT.clear()
+
 
 if __name__ == "__main__":
     unittest.main()

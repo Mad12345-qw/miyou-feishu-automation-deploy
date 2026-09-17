@@ -17,7 +17,12 @@ def link_value(value: Any) -> str:
     return str(value.get("link") or "") if isinstance(value, dict) else ""
 
 
-def sync_missing_workbench_rows(fs: Feishu, out_dir: Path, dry_run: bool = False) -> dict[str, Any]:
+def sync_missing_workbench_rows(
+    fs: Feishu,
+    out_dir: Path,
+    dry_run: bool = False,
+    preloaded_views: dict[str, dict[str, dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
     people = active_people(fs)
     name_counts = Counter(str(person.get("name") or "").strip() for person in people.values())
     duplicate_names = {name for name, count in name_counts.items() if name and count > 1}
@@ -29,7 +34,9 @@ def sync_missing_workbench_rows(fs: Feishu, out_dir: Path, dry_run: bool = False
     }
     views_by_binding: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for table_key in table_keys:
-        for detail in list_view_details(fs, TABLES[table_key]):
+        cached = (preloaded_views or {}).get(table_key)
+        details = list(cached.values()) if cached is not None else list_view_details(fs, TABLES[table_key])
+        for detail in details:
             if detail.get("_detail_error"):
                 continue
             field_id, user_id = view_filter_binding(detail)

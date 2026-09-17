@@ -1940,6 +1940,11 @@ def personnel_fields_changed(current: dict[str, Any], desired: dict[str, Any]) -
         elif isinstance(value, (int, float)):
             if not isinstance(current_value, (int, float)) or int(current_value) != int(value):
                 return True
+        elif isinstance(value, str):
+            # Feishu omits cleared text fields when records are read back. Treat
+            # a missing value and an empty string as the same state.
+            if text_value(current_value) != value:
+                return True
         elif current_value != value:
             return True
     return False

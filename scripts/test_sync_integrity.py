@@ -401,6 +401,10 @@ class SyncIntegrityTests(unittest.TestCase):
         self.assertFalse(personnel_fields_changed(current, desired))
         self.assertTrue(personnel_fields_changed(current, {**desired, "姓名": "新名字"}))
 
+    def test_missing_and_empty_personnel_text_are_equivalent(self) -> None:
+        self.assertFalse(personnel_fields_changed({}, {"岗位": ""}))
+        self.assertTrue(personnel_fields_changed({}, {"岗位": "运营"}))
+
     def test_contact_internal_error_is_retried(self) -> None:
         class ContactFeishu:
             def __init__(self) -> None:
@@ -445,6 +449,36 @@ class SyncIntegrityTests(unittest.TestCase):
         self.assertEqual(1, report["repaired"])
         self.assertEqual([USER_ID], workbench.user_ids(fs.updates[0]["fields"]["员工账号"]))
         self.assertIn(f"view={VIEW_ID}", fs.updates[0]["fields"]["点这里办理"]["link"])
+
+    def test_workbench_sync_reuses_preloaded_business_views(self) -> None:
+        fs = FakeFeishu()
+        spec = ("interview", "招募人账号（系统）", "招聘", "候选人", {"招募经纪人"}, "候选人", "打开我的候选人")
+        detail = {
+            "view_id": VIEW_ID,
+            "view_name": "招聘_测试员工_候选人",
+            "property": {
+                "filter_info": {
+                    "conditions": [
+                        {
+                            "field_id": "fld_recruiter",
+                            "operator": "is",
+                            "value": f'["{USER_ID}"]',
+                        }
+                    ]
+                }
+            },
+        }
+        with (
+            TemporaryDirectory() as tmp,
+            patch.object(workbench, "SPECS", [spec]),
+            patch.object(workbench, "list_view_details", side_effect=AssertionError("unexpected second view scan")),
+        ):
+            report = workbench.sync_missing_workbench_rows(
+                fs,
+                Path(tmp),
+                preloaded_views={"interview": {detail["view_name"]: detail}},
+            )
+        self.assertEqual([], report["missing_views"])
 
     def test_stale_system_generated_workbench_rows_are_hidden(self) -> None:
         class StaleRowFeishu(FakeFeishu):
