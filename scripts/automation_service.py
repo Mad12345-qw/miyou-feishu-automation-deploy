@@ -344,6 +344,13 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
             not_before_ms=0,
             recover_existing_links=True,
         )
+        if build.get("selected_interviews") != build.get("created_anchors"):
+            raise RuntimeError(
+                "Streamer creation incomplete: "
+                f"selected={build.get('selected_interviews', 0)}, "
+                f"created={build.get('created_anchors', 0)}, "
+                f"results={build.get('anchor_results', [])}"
+            )
         if anchor_maintenance_sync_enabled():
             photos = sync_interview_photos_to_anchors(fs, out_dir)
             anchor_displays = sync_anchor_display_names(fs, out_dir)

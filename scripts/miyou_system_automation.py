@@ -479,6 +479,30 @@ def created_records(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return records
 
 
+def keep_existing_fields(records: list[dict[str, Any]], field_names: set[str]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Remove optional fields that users have deleted or renamed in the live Base."""
+    removed: set[str] = set()
+    filtered: list[dict[str, Any]] = []
+    for record in records:
+        fields = record.get("fields") or {}
+        removed.update(str(name) for name in fields if name not in field_names)
+        filtered.append({**record, "fields": {name: value for name, value in fields.items() if name in field_names}})
+    return filtered, sorted(removed)
+
+
+def keep_existing_table_fields(
+    fs: Feishu,
+    table_key: str,
+    records: list[dict[str, Any]],
+    required_fields: set[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    field_names = {str(field.get("field_name") or "") for field in fs.fields(TABLES[table_key])}
+    missing_required = sorted(required_fields - field_names)
+    if missing_required:
+        raise RuntimeError(f"Required fields are missing from {table_key}: {missing_required}")
+    return keep_existing_fields(records, field_names)
+
+
 def ensure_fields(fs: Feishu, out_dir: Path) -> dict[str, Any]:
     required: dict[str, list[tuple[str, str, list[str] | None]]] = {
         "interview": [
@@ -1472,6 +1496,22 @@ def ensure_recovered_anchor_children(
             if anchor_id not in singleton_ids[table_key]:
                 missing[table_key].extend(desired[table_key])
 
+    removed_fields: dict[str, list[str]] = {}
+    required_link_fields = {
+        "node": {"关联主播"},
+        "task": {"对应主播"},
+        "visual": {"关联主播"},
+        "training": {"关联主播"},
+        "first_live": {"关联主播"},
+    }
+    for table_key, records in missing.items():
+        missing[table_key], removed_fields[table_key] = keep_existing_table_fields(
+            fs,
+            table_key,
+            records,
+            required_link_fields[table_key],
+        )
+
     create_results = {
         table_key: fs.batch_create(TABLES[table_key], records, batch_size=500) if records else []
         for table_key, records in missing.items()
@@ -1535,6 +1575,7 @@ def ensure_recovered_anchor_children(
         "created": {key: len(created_records(results)) for key, results in create_results.items()},
         "complete_anchors": len(complete_interview_updates),
         "failures": failures,
+        "removed_fields": removed_fields,
         "per_anchor": per_anchor,
         "create_results": create_results,
         "completion_update_results": completion_results,
@@ -1713,8 +1754,38 @@ def build_chain(
         if fields.get("照片"):
             anchor_records[-1]["fields"]["照片"] = fields["照片"]
 
+    anchor_records, removed_anchor_fields = keep_existing_table_fields(
+        fs,
+        "anchor",
+        anchor_records,
+        {"主播编号", ANCHOR_NAME_FIELD, "来源面试记录"},
+    )
     anchor_results = fs.batch_create(TABLES["anchor"], anchor_records, batch_size=100)
     anchors = created_records(anchor_results)
+
+    if len(anchors) != len(anchor_records):
+        payload = {
+            "batch": batch,
+            "checked_interviews": len(interviews),
+            "not_before_ms": not_before_ms,
+            "recovery_mode_enabled": recover_existing_links,
+            "recovered_existing_anchors": len(recovered_updates),
+            "recovered_existing_anchor_sources": len(recovered_anchor_updates),
+            "dangling_links_replaced": dangling_links_replaced,
+            "skipped_existing_anchors": skipped_existing_anchors,
+            "assignment_sync": assignment_sync,
+            "anchor_operator_sync": anchor_operator_sync,
+            "recovered_interview_update_results": recovered_results,
+            "recovered_anchor_update_results": recovered_anchor_results,
+            "recovered_child_repair": recovered_child_repair,
+            "selected_interviews": len(selected),
+            "created_anchors": len(anchors),
+            "removed_anchor_fields": removed_anchor_fields,
+            "anchor_results": anchor_results,
+            "creation_incomplete": True,
+        }
+        write_json(out_dir / f"build_chain_{batch}_result.json", payload)
+        return payload
 
     node_records = []
     task_records = []
@@ -1743,11 +1814,33 @@ def build_chain(
             }
         )
 
-    node_results = fs.batch_create(TABLES["node"], node_records, batch_size=500)
-    task_results = fs.batch_create(TABLES["task"], task_records, batch_size=500)
-    visual_results = fs.batch_create(TABLES["visual"], visual_records, batch_size=500)
-    training_results = fs.batch_create(TABLES["training"], training_records, batch_size=500)
-    first_live_results = fs.batch_create(TABLES["first_live"], first_live_records, batch_size=500)
+    child_records = {
+        "node": node_records,
+        "task": task_records,
+        "visual": visual_records,
+        "training": training_records,
+        "first_live": first_live_records,
+    }
+    required_link_fields = {
+        "node": {"关联主播"},
+        "task": {"对应主播"},
+        "visual": {"关联主播"},
+        "training": {"关联主播"},
+        "first_live": {"关联主播"},
+    }
+    removed_child_fields: dict[str, list[str]] = {}
+    for table_key, records in child_records.items():
+        child_records[table_key], removed_child_fields[table_key] = keep_existing_table_fields(
+            fs,
+            table_key,
+            records,
+            required_link_fields[table_key],
+        )
+    node_results = fs.batch_create(TABLES["node"], child_records["node"], batch_size=500)
+    task_results = fs.batch_create(TABLES["task"], child_records["task"], batch_size=500)
+    visual_results = fs.batch_create(TABLES["visual"], child_records["visual"], batch_size=500)
+    training_results = fs.batch_create(TABLES["training"], child_records["training"], batch_size=500)
+    first_live_results = fs.batch_create(TABLES["first_live"], child_records["first_live"], batch_size=500)
     interview_update_results = fs.batch_update(TABLES["interview"], interview_updates, batch_size=500)
     payload = {
         "batch": batch,
@@ -1765,6 +1858,9 @@ def build_chain(
         "recovered_child_repair": recovered_child_repair,
         "selected_interviews": len(selected),
         "created_anchors": len(anchors),
+        "removed_anchor_fields": removed_anchor_fields,
+        "removed_child_fields": removed_child_fields,
+        "creation_incomplete": False,
         "created_nodes": len(created_records(node_results)),
         "created_tasks": len(created_records(task_results)),
         "created_visual_records": len(created_records(visual_results)),

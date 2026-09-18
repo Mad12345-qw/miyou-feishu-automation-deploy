@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 import sync_missing_personal_entries as personal
 import sync_missing_workbench_rows as workbench
-from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, desired_anchor_number, find_existing_anchor_for_interview, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_management_summary, sync_one_interview_followup_to_anchors, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
+from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, desired_anchor_number, find_existing_anchor_for_interview, keep_existing_fields, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_management_summary, sync_one_interview_followup_to_anchors, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
 from repair_live_data_integrity import CHILD_SPECS, plan_duplicate_child_cleanup
 
 
@@ -104,6 +104,15 @@ class FakeFeishu:
 
 
 class SyncIntegrityTests(unittest.TestCase):
+    def test_deleted_optional_anchor_field_does_not_reject_the_whole_record(self) -> None:
+        records, removed = keep_existing_fields(
+            [{"fields": {"主播编号": "MYZB-1", "主播名字": "主播甲", "核心顾虑点": "已删除字段"}}],
+            {"主播编号", "主播名字"},
+        )
+
+        self.assertEqual([{"fields": {"主播编号": "MYZB-1", "主播名字": "主播甲"}}], records)
+        self.assertEqual(["核心顾虑点"], removed)
+
     def test_manual_anchor_gets_stable_number_from_its_record_id(self) -> None:
         record = {"record_id": "recvvth3N1Pu19", "fields": {"主播名字": "甄一诺", "主播编号": ""}}
 
