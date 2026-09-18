@@ -52,6 +52,8 @@ TRANSFER_TO_ANCHOR_FIELD = "通过转入主播"
 LEGACY_TRANSFER_TO_ANCHOR_FIELD = "面试通过，转入主播"
 ANCHOR_DISPLAY_FIELD = "主播昵称（编号）"
 ANCHOR_NAME_FIELD = "主播名字"
+INTERVIEW_FOLLOWUP_FIELD = "面试跟进情况（日更）"
+ANCHOR_INTERVIEW_FOLLOWUP_FIELD = "面试官跟进记录"
 SYSTEM_CREATED_BY_FIELD = "系统：创建人"
 SYSTEM_CREATED_AT_FIELD = "系统：创建时间"
 SYSTEM_MODIFIED_BY_FIELD = "系统：最后修改人"
@@ -302,16 +304,16 @@ class Feishu:
         records: list[dict[str, Any]] = []
         page_token = ""
         while True:
+            query: dict[str, Any] = {"page_size": page_size}
             body: dict[str, Any] = {
-                "page_size": page_size,
                 "filter": {
                     "conjunction": "and",
                     "conditions": [{"field_name": field_name, "operator": "is", "value": [value]}],
                 },
             }
             if page_token:
-                body["page_token"] = page_token
-            data = self.api("POST", f"/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/records/search", body=body)
+                query["page_token"] = page_token
+            data = self.api("POST", f"/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/records/search", query=query, body=body)
             if data.get("code") != 0:
                 raise RuntimeError(f"Failed to search records in {table_id} by {field_name}: {data}")
             payload = data.get("data") or {}
@@ -332,13 +334,11 @@ class Feishu:
         records: list[dict[str, Any]] = []
         page_token = ""
         while True:
-            body: dict[str, Any] = {
-                "page_size": page_size,
-                "filter": {"conjunction": "and", "conditions": conditions},
-            }
+            query: dict[str, Any] = {"page_size": page_size}
+            body: dict[str, Any] = {"filter": {"conjunction": "and", "conditions": conditions}}
             if page_token:
-                body["page_token"] = page_token
-            data = self.api("POST", f"/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/records/search", body=body)
+                query["page_token"] = page_token
+            data = self.api("POST", f"/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/records/search", query=query, body=body)
             if data.get("code") != 0:
                 raise RuntimeError(f"Failed to search records in {table_id}: {data}")
             payload = data.get("data") or {}
@@ -960,6 +960,51 @@ def sync_recent_interview_assignments(fs: Feishu, limit: int = 500) -> dict[str,
     return {"scanned_records": len(records), **result}
 
 
+def read_record(fs: Feishu, table_id: str, record_id: str) -> dict[str, Any]:
+    response = fs.api("GET", f"/bitable/v1/apps/{APP_TOKEN}/tables/{table_id}/records/{record_id}")
+    record = (response.get("data") or {}).get("record") or (response.get("data") or {})
+    if response.get("code") != 0 or not record.get("record_id"):
+        raise RuntimeError(f"Unable to read record {record_id} from {table_id}: {response}")
+    return record
+
+
+def sync_one_interview_followup_to_anchors(fs: Feishu, interview: dict[str, Any]) -> dict[str, Any]:
+    """Mirror an interview follow-up to every linked streamer profile."""
+    interview_id = str(interview.get("record_id") or "")
+    fields = interview.get("fields") or {}
+    anchor_ids = list(dict.fromkeys(linked_record_ids(fields.get("关联主播档案"))))
+    updates: list[dict[str, Any]] = []
+    missing_anchor_ids: list[str] = []
+    for anchor_id in anchor_ids:
+        try:
+            anchor = read_record(fs, TABLES["anchor"], anchor_id)
+        except RuntimeError:
+            missing_anchor_ids.append(anchor_id)
+            continue
+        anchor_fields = anchor.get("fields") or {}
+        source_ids = list(dict.fromkeys(linked_record_ids(anchor_fields.get("来源面试记录"))))
+        if interview_id and interview_id not in source_ids:
+            source_ids.append(interview_id)
+        values: list[str] = []
+        for source_id in source_ids or [interview_id]:
+            source = interview if source_id == interview_id else read_record(fs, TABLES["interview"], source_id)
+            value = text_value((source.get("fields") or {}).get(INTERVIEW_FOLLOWUP_FIELD)).strip()
+            if value and value not in values:
+                values.append(value)
+        desired = "\n\n".join(values)
+        current = text_value(anchor_fields.get(ANCHOR_INTERVIEW_FOLLOWUP_FIELD))
+        if current != desired:
+            updates.append({"record_id": anchor_id, "fields": {ANCHOR_INTERVIEW_FOLLOWUP_FIELD: desired}})
+    results = fs.batch_update(TABLES["anchor"], updates, batch_size=100) if updates else []
+    return {
+        "interview_record_id": interview_id,
+        "linked_anchors": len(anchor_ids),
+        "updated_anchors": len(updates),
+        "missing_anchor_ids": missing_anchor_ids,
+        "results": results,
+    }
+
+
 def sync_linked_anchor_operators(fs: Feishu, records: list[dict[str, Any]]) -> dict[str, Any]:
     """Keep ownership aligned without overwriting post-hire operator changes."""
     assignment_fields = {
@@ -989,6 +1034,7 @@ def sync_linked_anchor_operators(fs: Feishu, records: list[dict[str, Any]]) -> d
     updated_fields = {
         **{field_name: 0 for field_name in assignment_fields.values()},
         "运营经济人": 0,
+        ANCHOR_INTERVIEW_FOLLOWUP_FIELD: 0,
     }
     interview_updates: list[dict[str, Any]] = []
     operator_reassignments: list[dict[str, Any]] = []
@@ -1008,6 +1054,9 @@ def sync_linked_anchor_operators(fs: Feishu, records: list[dict[str, Any]]) -> d
             for field_name, users in desired.items()
             if set(user_ids(current.get(field_name))) != set(user_ids(users))
         }
+        desired_followup = text_value(interview_fields.get(INTERVIEW_FOLLOWUP_FIELD)).strip()
+        if text_value(current.get(ANCHOR_INTERVIEW_FOLLOWUP_FIELD)) != desired_followup:
+            changed[ANCHOR_INTERVIEW_FOLLOWUP_FIELD] = desired_followup
 
         # After a streamer profile exists, reassignment happens on that profile.
         # The interview is historical input and must not overwrite a later change.
@@ -1577,6 +1626,7 @@ def build_chain(
                     "主阶段": "待建联",
                     "招募经济人": fields.get("招募人账号（系统）") or [],
                     "面试官": fields.get("面试官账号（系统）") or [],
+                    ANCHOR_INTERVIEW_FOLLOWUP_FIELD: text_value(fields.get(INTERVIEW_FOLLOWUP_FIELD)).strip(),
                     "运营经济人": fields.get("对接运营账号（系统）") or [],
                     "建联时间": ms(interview_dt + timedelta(hours=2)),
                     "首次建联截止时间": ms(interview_dt + timedelta(hours=2)),
@@ -2591,7 +2641,14 @@ def sync_one_interview_personnel_assignment(fs: Feishu, record_id: str, out_dir:
         if desired_day and desired_day != current_day:
             changed[group_field] = desired_day
     results = fs.batch_update(TABLES["interview"], [{"record_id": record_id, "fields": changed}]) if changed else []
-    report = {"record_id": record_id, "updated_fields": sorted(changed), "unresolved_values": sorted(set(unresolved)), "results": results}
+    followup_sync = sync_one_interview_followup_to_anchors(fs, record)
+    report = {
+        "record_id": record_id,
+        "updated_fields": sorted(changed),
+        "unresolved_values": sorted(set(unresolved)),
+        "followup_sync": followup_sync,
+        "results": results,
+    }
     write_json(out_dir / f"sync_interview_assignment_{record_id}.json", report)
     return report
 

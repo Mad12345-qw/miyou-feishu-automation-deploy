@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 import sync_missing_personal_entries as personal
 import sync_missing_workbench_rows as workbench
-from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, find_existing_anchor_for_interview, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_management_summary, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
+from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, find_existing_anchor_for_interview, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_management_summary, sync_one_interview_followup_to_anchors, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
 from repair_live_data_integrity import CHILD_SPECS, plan_duplicate_child_cleanup
 
 
@@ -104,6 +104,60 @@ class FakeFeishu:
 
 
 class SyncIntegrityTests(unittest.TestCase):
+    def test_filtered_record_search_paginates_in_query_string(self) -> None:
+        class PagingFeishu(Feishu):
+            def __init__(self) -> None:
+                super().__init__("token")
+                self.calls = []
+
+            def api(self, method, path, query=None, body=None):
+                self.calls.append((query, body))
+                if len(self.calls) == 1:
+                    return {"code": 0, "data": {"items": [{"record_id": "rec-1"}], "has_more": True, "page_token": "next"}}
+                return {"code": 0, "data": {"items": [{"record_id": "rec-2"}], "has_more": False}}
+
+        fs = PagingFeishu()
+        records = fs.search_records_by_filter("tbl", [{"field_name": "备注", "operator": "isNotEmpty", "value": []}])
+
+        self.assertEqual(["rec-1", "rec-2"], [record["record_id"] for record in records])
+        self.assertEqual({"page_size": 500}, fs.calls[0][0])
+        self.assertEqual({"page_size": 500, "page_token": "next"}, fs.calls[1][0])
+        self.assertNotIn("page_token", fs.calls[1][1])
+
+    def test_interview_followup_is_mirrored_to_linked_anchor(self) -> None:
+        class FollowupFeishu:
+            def __init__(self) -> None:
+                self.updated = []
+
+            def api(self, method, path, query=None, body=None):
+                if method == "GET" and path.endswith("/records/rec-anchor"):
+                    return {
+                        "code": 0,
+                        "data": {
+                            "record": {
+                                "record_id": "rec-anchor",
+                                "fields": {"来源面试记录": ["rec-interview"], "面试官跟进记录": "旧内容"},
+                            }
+                        },
+                    }
+                raise AssertionError((method, path, query, body))
+
+            def batch_update(self, table_id, records, batch_size=100):
+                self.updated.extend(records)
+                return [{"code": 0}]
+
+        fs = FollowupFeishu()
+        report = sync_one_interview_followup_to_anchors(
+            fs,
+            {
+                "record_id": "rec-interview",
+                "fields": {"关联主播档案": ["rec-anchor"], "面试跟进情况（日更）": "最新内容"},
+            },
+        )
+
+        self.assertEqual(1, report["updated_anchors"])
+        self.assertEqual("最新内容", fs.updated[0]["fields"]["面试官跟进记录"])
+
     def test_write_json_replaces_existing_result(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "result.json"
