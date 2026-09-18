@@ -11,7 +11,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 
 from mobile_interview_form import register_mobile_interview_form
-from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_interview_display_fields, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory, sync_recent_interview_assignments
+from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_anchor_numbers, sync_missing_interview_display_fields, sync_one_anchor_number, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory, sync_recent_interview_assignments
 from run_miyou_rule_engine import reconcile
 from sync_missing_personal_entries import sync_missing_personal_entries
 from sync_missing_workbench_rows import sync_missing_workbench_rows
@@ -335,6 +335,7 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
             fs,
             limit=max(1, int(os.environ.get("RECENT_INTERVIEW_ASSIGNMENT_LIMIT", "500"))),
         )
+        anchor_numbers = sync_missing_anchor_numbers(fs, out_dir)
         build = build_chain(
             fs,
             batch,
@@ -353,6 +354,7 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
         result = {
             "batch": batch,
             "recent_assignments": recent_assignments,
+            "anchor_numbers": anchor_numbers,
             "build": build,
             "photos": photos,
             "anchor_displays": anchor_displays,
@@ -570,11 +572,12 @@ def enqueue_feishu_record_changes(
     """Queue changed interview rows so the event receiver can acknowledge immediately."""
     if file_token != APP_TOKEN:
         return {"queued": 0, "ignored": "other_app"}
-    if table_id != TABLES["interview"]:
+    if table_id not in {TABLES["interview"], TABLES["anchor"]}:
         note_feishu_record_event(event_type, "ignored")
         return {"queued": 0, "ignored": "other_table"}
 
-    note_feishu_record_event(event_type, "interview")
+    table_kind = "interview" if table_id == TABLES["interview"] else "anchor"
+    note_feishu_record_event(event_type, table_kind)
     queued = 0
     for record_id in dict.fromkeys(str(value or "").strip() for value in record_ids):
         if not record_id:
@@ -621,14 +624,19 @@ def feishu_record_worker() -> None:
                 app.logger.info("Deferred Feishu interview event for %s until the monthly API quota resets.", record_id)
                 continue
             fs = Feishu(tenant_token())
-            result = sync_one_interview_personnel_assignment(fs, record_id, Path("runtime"))
+            if table_id == TABLES["interview"]:
+                result = sync_one_interview_personnel_assignment(fs, record_id, Path("runtime"))
+                updated = result.get("updated_fields", {})
+                trigger_anchor_transfer_async(f"Feishu interview event via {transport}")
+            else:
+                result = sync_one_anchor_number(fs, record_id, Path("runtime"))
+                updated = ["主播编号"] if result.get("updated") else []
             app.logger.info(
-                "Processed Feishu interview event via %s for %s: %s",
+                "Processed Feishu record event via %s for %s: %s",
                 transport,
                 record_id,
-                result.get("updated_fields", {}),
+                updated,
             )
-            trigger_anchor_transfer_async(f"Feishu interview event via {transport}")
         except Exception as exc:
             if mark_api_quota_exhausted(exc):
                 app.logger.error("Feishu record event processing paused because the monthly API quota is exhausted.")

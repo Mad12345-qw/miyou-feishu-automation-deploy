@@ -1205,6 +1205,72 @@ def anchor_display_name(fields: dict[str, Any]) -> str:
     return nickname or number
 
 
+def desired_anchor_number(record: dict[str, Any]) -> str:
+    """Return a stable number for a meaningful streamer row that lacks one."""
+    fields = record.get("fields") or {}
+    current = text_value(fields.get("主播编号")).strip()
+    if current:
+        return current
+    record_id = str(record.get("record_id") or record.get("id") or "")
+    name = (
+        text_value(fields.get(ANCHOR_NAME_FIELD)).strip()
+        or text_value(fields.get("主播昵称")).strip()
+        or text_value(fields.get("真实姓名")).strip()
+    )
+    source_ids = linked_record_ids(fields.get("来源面试记录"))
+    if not record_id or (not name and not source_ids):
+        return ""
+    if source_ids:
+        return f"MYZB-AUTO-{source_ids[0][-10:]}"
+    return f"MYZB-MANUAL-{record_id[-10:]}"
+
+
+def sync_one_anchor_number(fs: Feishu, record_id: str, out_dir: Path) -> dict[str, Any]:
+    """Assign a number to one manually created streamer row without touching other fields."""
+    record = read_record(fs, TABLES["anchor"], record_id)
+    current = text_value((record.get("fields") or {}).get("主播编号")).strip()
+    desired = desired_anchor_number(record)
+    updates = []
+    if desired and desired != current:
+        updates.append({"record_id": record_id, "fields": {"主播编号": desired}})
+    results = fs.batch_update(TABLES["anchor"], updates) if updates else []
+    report = {
+        "record_id": record_id,
+        "before": current,
+        "after": desired or current,
+        "updated": bool(updates),
+        "results": results,
+    }
+    write_json(out_dir / f"sync_anchor_number_{record_id}.json", report)
+    return report
+
+
+def sync_missing_anchor_numbers(fs: Feishu, out_dir: Path) -> dict[str, Any]:
+    """Backfill only blank numbers on non-empty streamer rows."""
+    records = fs.list_records(TABLES["anchor"], page_size=500)
+    updates: list[dict[str, Any]] = []
+    skipped_blank_rows = 0
+    for record in records:
+        current = text_value((record.get("fields") or {}).get("主播编号")).strip()
+        if current:
+            continue
+        desired = desired_anchor_number(record)
+        if not desired:
+            skipped_blank_rows += 1
+            continue
+        updates.append({"record_id": record["record_id"], "fields": {"主播编号": desired}})
+    results = fs.batch_update(TABLES["anchor"], updates, batch_size=100) if updates else []
+    report = {
+        "scanned_records": len(records),
+        "updated_records": len(updates),
+        "skipped_blank_rows": skipped_blank_rows,
+        "failed_batches": sum(1 for result in results if result.get("code") != 0),
+        "results": results,
+    }
+    write_json(out_dir / "sync_missing_anchor_numbers_result.json", report)
+    return report
+
+
 def build_anchor_child_payloads(
     anchor: dict[str, Any],
     interview: dict[str, Any],

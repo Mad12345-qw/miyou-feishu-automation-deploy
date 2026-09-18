@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 import sync_missing_personal_entries as personal
 import sync_missing_workbench_rows as workbench
-from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, find_existing_anchor_for_interview, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_management_summary, sync_one_interview_followup_to_anchors, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
+from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, desired_anchor_number, find_existing_anchor_for_interview, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_management_summary, sync_one_interview_followup_to_anchors, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
 from repair_live_data_integrity import CHILD_SPECS, plan_duplicate_child_cleanup
 
 
@@ -104,6 +104,22 @@ class FakeFeishu:
 
 
 class SyncIntegrityTests(unittest.TestCase):
+    def test_manual_anchor_gets_stable_number_from_its_record_id(self) -> None:
+        record = {"record_id": "recvvth3N1Pu19", "fields": {"主播名字": "甄一诺", "主播编号": ""}}
+
+        self.assertEqual("MYZB-MANUAL-vth3N1Pu19", desired_anchor_number(record))
+
+    def test_anchor_with_source_uses_interview_based_number(self) -> None:
+        record = {
+            "record_id": "rec-anchor",
+            "fields": {"主播名字": "甄一诺", "来源面试记录": ["recvvoiISa30ni"]},
+        }
+
+        self.assertEqual("MYZB-AUTO-voiISa30ni", desired_anchor_number(record))
+
+    def test_empty_anchor_row_is_not_numbered(self) -> None:
+        self.assertEqual("", desired_anchor_number({"record_id": "rec-empty", "fields": {}}))
+
     def test_filtered_record_search_paginates_in_query_string(self) -> None:
         class PagingFeishu(Feishu):
             def __init__(self) -> None:
