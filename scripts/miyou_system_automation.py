@@ -913,6 +913,39 @@ def find_existing_anchor_for_interview(
                 return source_match, manually_maintained, richness
 
             return max(candidates.values(), key=rank)
+        interview_operator_ids = set(user_ids(fields.get("对接运营账号（系统）")))
+        interview_operator_names = normalized_owner_names(fields.get("对接运营"))
+        manual_candidates: list[dict[str, Any]] = []
+        for anchor in anchors_by_id.values():
+            anchor_fields = anchor.get("fields") or {}
+            anchor_name = (
+                text_value(anchor_fields.get(ANCHOR_NAME_FIELD)).strip()
+                or text_value(anchor_fields.get("真实姓名")).strip()
+            )
+            number = text_value(anchor_fields.get("主播编号")).strip()
+            if anchor_name != candidate_name or not number.startswith("MYZB-MANUAL-"):
+                continue
+            if linked_record_ids(anchor_fields.get("来源面试记录")):
+                continue
+            if text_value(anchor_fields.get("自动化批次")).strip():
+                continue
+            if text_value(anchor_fields.get("数据迁移批次")).strip() or text_value(anchor_fields.get("历史来源键")).strip():
+                continue
+            anchor_operator_ids = set(user_ids(anchor_fields.get("运营经济人")))
+            anchor_operator_names = normalized_owner_names(anchor_fields.get("运营经济人"))
+            same_operator = bool(
+                (interview_operator_ids and anchor_operator_ids and interview_operator_ids.intersection(anchor_operator_ids))
+                or (
+                    interview_operator_names
+                    and anchor_operator_names
+                    and interview_operator_names.intersection(anchor_operator_names)
+                )
+            )
+            if same_operator:
+                manual_candidates.append(anchor)
+        if len(manual_candidates) == 1:
+            return manual_candidates[0]
+        return None
     elif linked_ids:
         return {"record_id": linked_ids[0], "fields": {}}
     if not candidate_name:

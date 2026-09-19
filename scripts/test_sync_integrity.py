@@ -385,6 +385,52 @@ class SyncIntegrityTests(unittest.TestCase):
         selected = find_existing_anchor_for_interview(object(), interview, anchors)
         self.assertEqual("rec_manual", selected["record_id"])
 
+    def test_unique_manual_anchor_with_same_operator_is_reused_before_creation(self) -> None:
+        interview = {
+            "record_id": "rec_interview",
+            "fields": {
+                "候选人姓名": "主播甲",
+                "对接运营": "运营甲",
+                "对接运营账号（系统）": [{"id": "ou_operator"}],
+            },
+        }
+        anchors = {
+            "rec_manual": {
+                "record_id": "rec_manual",
+                "fields": {
+                    "主播编号": "MYZB-MANUAL-recmanual",
+                    "主播名字": "主播甲",
+                    "运营经济人": [{"id": "ou_operator", "name": "运营甲"}],
+                    "主播状态": "有意向考虑中",
+                },
+            }
+        }
+
+        selected = find_existing_anchor_for_interview(object(), interview, anchors)
+
+        self.assertEqual("rec_manual", selected["record_id"])
+
+    def test_manual_anchor_for_another_operator_is_not_reused(self) -> None:
+        interview = {
+            "record_id": "rec_interview",
+            "fields": {
+                "候选人姓名": "主播甲",
+                "对接运营账号（系统）": [{"id": "ou_operator_a"}],
+            },
+        }
+        anchors = {
+            "rec_manual": {
+                "record_id": "rec_manual",
+                "fields": {
+                    "主播编号": "MYZB-MANUAL-recmanual",
+                    "主播名字": "主播甲",
+                    "运营经济人": [{"id": "ou_operator_b", "name": "运营乙"}],
+                },
+            }
+        }
+
+        self.assertIsNone(find_existing_anchor_for_interview(object(), interview, anchors))
+
     def test_personnel_alias_resolves_to_the_account(self) -> None:
         class AliasFeishu:
             def __init__(self) -> None:
