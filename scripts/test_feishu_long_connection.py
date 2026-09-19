@@ -82,6 +82,30 @@ class FeishuLongConnectionTests(unittest.TestCase):
         self.assertEqual(["rec-a", "rec-b"], enqueue.call_args.args[3])
         self.assertEqual("long_connection", enqueue.call_args.args[4])
 
+    def test_anchor_event_updates_linked_interview_followup(self) -> None:
+        fs = object()
+        anchor = {"record_id": "rec-anchor", "fields": {"来源面试记录": ["rec-interview"]}}
+        with (
+            patch.object(service, "sync_one_anchor_number", return_value={"updated": False}) as number_sync,
+            patch.object(service, "read_record", return_value=anchor) as read,
+            patch.object(
+                service,
+                "sync_one_anchor_followup_to_interviews",
+                return_value={"updated_interviews": 1},
+            ) as followup_sync,
+        ):
+            result = service.process_feishu_record_change(
+                fs,
+                service.TABLES["anchor"],
+                "rec-anchor",
+                "long_connection",
+            )
+
+        number_sync.assert_called_once()
+        read.assert_called_once_with(fs, service.TABLES["anchor"], "rec-anchor")
+        followup_sync.assert_called_once_with(fs, anchor)
+        self.assertEqual(["面试跟进情况（日更）"], result["updated"])
+
     def test_other_base_is_not_queued(self) -> None:
         result = service.enqueue_feishu_record_changes(
             "drive.file.bitable_record_changed_v1",

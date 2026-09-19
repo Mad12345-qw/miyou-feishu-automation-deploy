@@ -11,7 +11,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 
 from mobile_interview_form import register_mobile_interview_form
-from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_anchor_numbers, sync_missing_interview_display_fields, sync_one_anchor_number, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory, sync_recent_interview_assignments
+from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, read_record, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_anchor_numbers, sync_missing_interview_display_fields, sync_one_anchor_followup_to_interviews, sync_one_anchor_number, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory, sync_recent_interview_assignments
 from run_miyou_rule_engine import reconcile
 from sync_missing_personal_entries import sync_missing_personal_entries
 from sync_missing_workbench_rows import sync_missing_workbench_rows
@@ -617,6 +617,30 @@ def handle_long_connection_record_event(data: object) -> dict[str, object]:
     )
 
 
+def process_feishu_record_change(
+    fs: Feishu,
+    table_id: str,
+    record_id: str,
+    transport: str,
+) -> dict[str, object]:
+    """Run the narrow maintenance required for one changed Base record."""
+    if table_id == TABLES["interview"]:
+        result = sync_one_interview_personnel_assignment(fs, record_id, Path("runtime"))
+        updated = result.get("updated_fields", {})
+        trigger_anchor_transfer_async(f"Feishu interview event via {transport}")
+    else:
+        number_result = sync_one_anchor_number(fs, record_id, Path("runtime"))
+        anchor = read_record(fs, TABLES["anchor"], record_id)
+        followup_result = sync_one_anchor_followup_to_interviews(fs, anchor)
+        result = {"number": number_result, "followup_sync": followup_result}
+        updated = []
+        if number_result.get("updated"):
+            updated.append("主播编号")
+        if followup_result.get("updated_interviews"):
+            updated.append("面试跟进情况（日更）")
+    return {"result": result, "updated": updated}
+
+
 def feishu_record_worker() -> None:
     while True:
         table_id, record_id, transport = FEISHU_RECORD_QUEUE.get()
@@ -631,13 +655,8 @@ def feishu_record_worker() -> None:
                 app.logger.info("Deferred Feishu interview event for %s until the monthly API quota resets.", record_id)
                 continue
             fs = Feishu(tenant_token())
-            if table_id == TABLES["interview"]:
-                result = sync_one_interview_personnel_assignment(fs, record_id, Path("runtime"))
-                updated = result.get("updated_fields", {})
-                trigger_anchor_transfer_async(f"Feishu interview event via {transport}")
-            else:
-                result = sync_one_anchor_number(fs, record_id, Path("runtime"))
-                updated = ["主播编号"] if result.get("updated") else []
+            processed = process_feishu_record_change(fs, table_id, record_id, transport)
+            updated = processed["updated"]
             app.logger.info(
                 "Processed Feishu record event via %s for %s: %s",
                 transport,
@@ -782,7 +801,7 @@ def health() -> object:
             "last_personnel_provisioning": last_provisioning,
             "last_anchor_transfer": last_anchor_transfer,
             "anchor_transfer_wake_requested": anchor_transfer_wake_requested,
-            "schema_version": "2026-09-17-event-driven-personnel-v13",
+            "schema_version": "2026-09-19-bidirectional-interview-followup-v14",
             "active_batch": os.environ.get("AUTOMATION_ACTIVE_BATCH", ""),
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
         }

@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 import sync_missing_personal_entries as personal
 import sync_missing_workbench_rows as workbench
-from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, desired_anchor_number, find_existing_anchor_for_interview, keep_existing_fields, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_management_summary, sync_one_interview_followup_to_anchors, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
+from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, desired_anchor_number, find_existing_anchor_for_interview, keep_existing_fields, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_management_summary, sync_one_anchor_followup_to_interviews, sync_one_interview_followup_to_anchors, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
 from repair_live_data_integrity import CHILD_SPECS, plan_duplicate_child_cleanup
 
 
@@ -182,6 +182,119 @@ class SyncIntegrityTests(unittest.TestCase):
 
         self.assertEqual(1, report["updated_anchors"])
         self.assertEqual("最新内容", fs.updated[0]["fields"]["面试官跟进记录"])
+
+    def test_interview_followup_does_not_write_when_anchor_already_matches(self) -> None:
+        class FollowupFeishu:
+            def __init__(self) -> None:
+                self.updated = []
+
+            def api(self, method, path, query=None, body=None):
+                return {
+                    "code": 0,
+                    "data": {
+                        "record": {
+                            "record_id": "rec-anchor",
+                            "fields": {
+                                "来源面试记录": ["rec-interview"],
+                                "面试官跟进记录": "相同内容",
+                            },
+                        }
+                    },
+                }
+
+            def batch_update(self, table_id, records, batch_size=100):
+                self.updated.extend(records)
+                return [{"code": 0}]
+
+        fs = FollowupFeishu()
+        report = sync_one_interview_followup_to_anchors(
+            fs,
+            {
+                "record_id": "rec-interview",
+                "fields": {"关联主播档案": ["rec-anchor"], "面试跟进情况（日更）": "相同内容"},
+            },
+        )
+
+        self.assertEqual(0, report["updated_anchors"])
+        self.assertEqual([], fs.updated)
+
+    def test_anchor_followup_is_mirrored_to_all_linked_interviews(self) -> None:
+        class FollowupFeishu:
+            def __init__(self) -> None:
+                self.updated = []
+
+            def api(self, method, path, query=None, body=None):
+                record_id = path.rsplit("/", 1)[-1]
+                values = {"rec-interview-a": "旧内容", "rec-interview-b": "其他旧内容"}
+                if method == "GET" and record_id in values:
+                    return {
+                        "code": 0,
+                        "data": {
+                            "record": {
+                                "record_id": record_id,
+                                "fields": {"面试跟进情况（日更）": values[record_id]},
+                            }
+                        },
+                    }
+                raise AssertionError((method, path, query, body))
+
+            def batch_update(self, table_id, records, batch_size=100):
+                self.updated.extend(records)
+                return [{"code": 0}]
+
+        fs = FollowupFeishu()
+        report = sync_one_anchor_followup_to_interviews(
+            fs,
+            {
+                "record_id": "rec-anchor",
+                "fields": {
+                    "来源面试记录": ["rec-interview-a", "rec-interview-b"],
+                    "面试官跟进记录": "03填写的新内容",
+                },
+            },
+        )
+
+        self.assertEqual(2, report["linked_interviews"])
+        self.assertEqual(2, report["updated_interviews"])
+        self.assertEqual(
+            {"rec-interview-a", "rec-interview-b"},
+            {record["record_id"] for record in fs.updated},
+        )
+        self.assertTrue(
+            all(record["fields"]["面试跟进情况（日更）"] == "03填写的新内容" for record in fs.updated)
+        )
+
+    def test_anchor_followup_does_not_write_when_interview_already_matches(self) -> None:
+        class FollowupFeishu:
+            def __init__(self) -> None:
+                self.updated = []
+
+            def api(self, method, path, query=None, body=None):
+                return {
+                    "code": 0,
+                    "data": {
+                        "record": {
+                            "record_id": "rec-interview",
+                            "fields": {"面试跟进情况（日更）": "相同内容"},
+                        }
+                    },
+                }
+
+            def batch_update(self, table_id, records, batch_size=100):
+                self.updated.extend(records)
+                return [{"code": 0}]
+
+        fs = FollowupFeishu()
+        report = sync_one_anchor_followup_to_interviews(
+            fs,
+            {
+                "record_id": "rec-anchor",
+                "fields": {"来源面试记录": ["rec-interview"], "面试官跟进记录": "相同内容"},
+            },
+        )
+
+        self.assertEqual(0, report["updated_interviews"])
+        self.assertEqual([], fs.updated)
 
     def test_write_json_replaces_existing_result(self) -> None:
         with TemporaryDirectory() as directory:
@@ -519,6 +632,39 @@ class SyncIntegrityTests(unittest.TestCase):
 
         self.assertEqual(0, report["operator_reassignments"])
         self.assertEqual([{"id": "ou_new"}], fs.updates[TABLES["anchor"]][0]["fields"]["运营经济人"])
+
+    def test_periodic_ownership_sync_does_not_overwrite_anchor_followup(self) -> None:
+        class OwnershipFeishu:
+            def __init__(self) -> None:
+                self.updates = {}
+
+            def list_records(self, table_id, page_size=500):
+                if table_id == TABLES["anchor"]:
+                    return [{
+                        "record_id": "rec_anchor",
+                        "fields": {"招募经济人": [], "面试官跟进记录": "03刚填写的内容"},
+                    }]
+                return []
+
+            def batch_update(self, table_id, records, batch_size=100):
+                self.updates.setdefault(table_id, []).extend(records)
+                return [{"code": 0, "data": {"records": records}}]
+
+        fs = OwnershipFeishu()
+        interviews = [{
+            "record_id": "rec_interview",
+            "fields": {
+                "关联主播档案": ["rec_anchor"],
+                "招募人账号（系统）": [{"id": "ou_recruiter"}],
+                "面试跟进情况（日更）": "02的旧内容",
+            },
+        }]
+
+        sync_linked_anchor_operators(fs, interviews)
+
+        anchor_fields = fs.updates[TABLES["anchor"]][0]["fields"]
+        self.assertEqual([{"id": "ou_recruiter"}], anchor_fields["招募经济人"])
+        self.assertNotIn("面试官跟进记录", anchor_fields)
 
     def test_unchanged_personnel_fields_do_not_trigger_a_write(self) -> None:
         current = {"姓名": "测试员工", "飞书用户": [{"id": USER_ID}], "角色": ["面试官", "招募经纪人"], "是否创建个人入口": True}

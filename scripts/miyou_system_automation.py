@@ -1062,6 +1062,33 @@ def sync_one_interview_followup_to_anchors(fs: Feishu, interview: dict[str, Any]
     }
 
 
+def sync_one_anchor_followup_to_interviews(fs: Feishu, anchor: dict[str, Any]) -> dict[str, Any]:
+    """Mirror a streamer follow-up to every linked interview record."""
+    anchor_id = str(anchor.get("record_id") or "")
+    fields = anchor.get("fields") or {}
+    interview_ids = list(dict.fromkeys(linked_record_ids(fields.get("来源面试记录"))))
+    desired = text_value(fields.get(ANCHOR_INTERVIEW_FOLLOWUP_FIELD)).strip()
+    updates: list[dict[str, Any]] = []
+    missing_interview_ids: list[str] = []
+    for interview_id in interview_ids:
+        try:
+            interview = read_record(fs, TABLES["interview"], interview_id)
+        except RuntimeError:
+            missing_interview_ids.append(interview_id)
+            continue
+        current = text_value((interview.get("fields") or {}).get(INTERVIEW_FOLLOWUP_FIELD))
+        if current != desired:
+            updates.append({"record_id": interview_id, "fields": {INTERVIEW_FOLLOWUP_FIELD: desired}})
+    results = fs.batch_update(TABLES["interview"], updates, batch_size=100) if updates else []
+    return {
+        "anchor_record_id": anchor_id,
+        "linked_interviews": len(interview_ids),
+        "updated_interviews": len(updates),
+        "missing_interview_ids": missing_interview_ids,
+        "results": results,
+    }
+
+
 def sync_linked_anchor_operators(fs: Feishu, records: list[dict[str, Any]]) -> dict[str, Any]:
     """Keep ownership aligned without overwriting post-hire operator changes."""
     assignment_fields = {
@@ -1091,7 +1118,6 @@ def sync_linked_anchor_operators(fs: Feishu, records: list[dict[str, Any]]) -> d
     updated_fields = {
         **{field_name: 0 for field_name in assignment_fields.values()},
         "运营经济人": 0,
-        ANCHOR_INTERVIEW_FOLLOWUP_FIELD: 0,
     }
     interview_updates: list[dict[str, Any]] = []
     operator_reassignments: list[dict[str, Any]] = []
@@ -1111,10 +1137,6 @@ def sync_linked_anchor_operators(fs: Feishu, records: list[dict[str, Any]]) -> d
             for field_name, users in desired.items()
             if set(user_ids(current.get(field_name))) != set(user_ids(users))
         }
-        desired_followup = text_value(interview_fields.get(INTERVIEW_FOLLOWUP_FIELD)).strip()
-        if text_value(current.get(ANCHOR_INTERVIEW_FOLLOWUP_FIELD)) != desired_followup:
-            changed[ANCHOR_INTERVIEW_FOLLOWUP_FIELD] = desired_followup
-
         # After a streamer profile exists, reassignment happens on that profile.
         # The interview is historical input and must not overwrite a later change.
         anchor_operator = current.get("运营经济人") or []
