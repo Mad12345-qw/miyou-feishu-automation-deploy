@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 import sync_missing_personal_entries as personal
 import sync_missing_workbench_rows as workbench
-from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, desired_anchor_number, find_existing_anchor_for_interview, keep_existing_fields, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_management_summary, sync_one_anchor_followup_to_interviews, sync_one_interview_followup_to_anchors, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
+from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, desired_anchor_number, find_existing_anchor_for_interview, keep_existing_fields, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_management_summary, sync_one_anchor_followup_to_interviews, sync_one_interview_followup_to_anchors, sync_one_interview_personnel_assignment, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
 from repair_live_data_integrity import CHILD_SPECS, plan_duplicate_child_cleanup
 
 
@@ -182,6 +182,54 @@ class SyncIntegrityTests(unittest.TestCase):
 
         self.assertEqual(1, report["updated_anchors"])
         self.assertEqual("最新内容", fs.updated[0]["fields"]["面试官跟进记录"])
+
+    def test_hidden_recruiter_account_does_not_backfill_the_legacy_display_field(self) -> None:
+        class InterviewFeishu:
+            def __init__(self) -> None:
+                self.updated = []
+
+            def api(self, method, path, query=None, body=None):
+                return {
+                    "code": 0,
+                    "data": {
+                        "record": {
+                            "record_id": "rec-interview",
+                            "fields": {
+                                "招募人": "",
+                                "招募人账号（系统）": [{"id": USER_ID, "name": "测试员工"}],
+                                "关联主播档案": [],
+                            },
+                        }
+                    },
+                }
+
+            def list_records(self, table_id, page_size=500):
+                if table_id == TABLES["personnel"]:
+                    return [{
+                        "record_id": "rec-person",
+                        "fields": {
+                            "姓名": "测试员工",
+                            "飞书用户": [{"id": USER_ID}],
+                            "在职状态": "在职",
+                            "账号状态": "正常",
+                            "角色": ["招募经纪人"],
+                        },
+                    }]
+                return []
+
+            def fields(self, table_id):
+                return [{"field_name": "邀约日期（按天分组）", "type": 20}]
+
+            def batch_update(self, table_id, records, batch_size=500):
+                self.updated.extend(records)
+                return [{"code": 0}]
+
+        fs = InterviewFeishu()
+        with TemporaryDirectory() as directory:
+            report = sync_one_interview_personnel_assignment(fs, "rec-interview", Path(directory))
+
+        self.assertEqual([], report["updated_fields"])
+        self.assertEqual([], fs.updated)
 
     def test_interview_followup_does_not_write_when_anchor_already_matches(self) -> None:
         class FollowupFeishu:

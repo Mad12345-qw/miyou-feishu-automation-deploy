@@ -144,6 +144,18 @@ class FeishuLongConnectionTests(unittest.TestCase):
         self.assertTrue(service.PERSONNEL_WAKE_EVENT.is_set())
         service.PERSONNEL_WAKE_EVENT.clear()
 
+    def test_interview_integrity_cycle_never_writes_the_active_interview_table(self) -> None:
+        with (
+            patch.object(service, "tenant_token") as tenant_token,
+            patch.object(service, "Feishu") as feishu,
+        ):
+            result = service.run_interview_integrity_cycle()
+
+        tenant_token.assert_not_called()
+        feishu.assert_not_called()
+        self.assertEqual("disabled", result["mode"])
+        self.assertEqual(0, result["records_updated"])
+
 
 if __name__ == "__main__":
     unittest.main()

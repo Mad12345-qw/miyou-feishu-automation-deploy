@@ -2797,7 +2797,6 @@ def sync_one_interview_personnel_assignment(fs: Feishu, record_id: str, out_dir:
     for person in active_people:
         name_counts[person["name"]] = name_counts.get(person["name"], 0) + 1
     people_by_name: dict[str, list[dict[str, str]]] = {}
-    display_by_user_id: dict[str, str] = {}
     recruiters_by_user_id: dict[str, str] = {}
     for person in active_people:
         name = str(person["name"])
@@ -2812,7 +2811,6 @@ def sync_one_interview_personnel_assignment(fs: Feishu, record_id: str, out_dir:
                 people_by_name.pop(alias, None)
         for user in person["users"]:
             user_id = str(user["id"])
-            display_by_user_id[user_id] = display_name
             if "招募经纪人" in person["roles"]:
                 recruiters_by_user_id[user_id] = display_name
 
@@ -2824,8 +2822,6 @@ def sync_one_interview_personnel_assignment(fs: Feishu, record_id: str, out_dir:
         account_name = str(spec["account_field"])
         existing_ids = user_ids(fields.get(account_name))
         if not selected:
-            if len(existing_ids) == 1 and existing_ids[0] in display_by_user_id:
-                changed[visible_name] = display_by_user_id[existing_ids[0]]
             continue
         users = people_by_name.get(selected)
         if not users and visible_name == "招募人":

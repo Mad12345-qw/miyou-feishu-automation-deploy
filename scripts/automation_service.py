@@ -11,7 +11,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 
 from mobile_interview_form import register_mobile_interview_form
-from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, read_record, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_anchor_numbers, sync_missing_interview_display_fields, sync_one_anchor_followup_to_interviews, sync_one_anchor_number, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory, sync_recent_interview_assignments
+from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, read_record, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_anchor_numbers, sync_one_anchor_followup_to_interviews, sync_one_anchor_number, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory, sync_recent_interview_assignments
 from run_miyou_rule_engine import reconcile
 from sync_missing_personal_entries import sync_missing_personal_entries
 from sync_missing_workbench_rows import sync_missing_workbench_rows
@@ -230,13 +230,11 @@ def run_personnel_entry_cycle(wait_for_scan_seconds: float = 0) -> dict[str, obj
         try:
             fs = Feishu(tenant_token())
             out_dir = Path("runtime")
-            if INTERVIEW_INTEGRITY_LOCK.acquire(blocking=False):
-                try:
-                    display_repairs = sync_missing_interview_display_fields(fs, out_dir)
-                finally:
-                    INTERVIEW_INTEGRITY_LOCK.release()
-            else:
-                display_repairs = {"skipped": True, "reason": "Interview integrity sync is already running."}
+            display_repairs = {
+                "mode": "disabled",
+                "records_updated": 0,
+                "reason": "Bulk interview display writes are disabled to protect active data entry.",
+            }
             personnel = sync_personnel_directory(fs, out_dir)
             surface = ensure_interview_workflow_surface(fs, out_dir)
             dropdowns = sync_interview_personnel_dropdowns(fs, out_dir, sync_records=False)
@@ -296,16 +294,11 @@ def run_personnel_entry_cycle(wait_for_scan_seconds: float = 0) -> dict[str, obj
 
 
 def run_interview_integrity_cycle() -> dict[str, object]:
-    if not INTERVIEW_INTEGRITY_LOCK.acquire(blocking=False):
-        return {"skipped": True, "reason": "Interview integrity sync is already running."}
-    if not FEISHU_SCAN_LOCK.acquire(blocking=False):
-        INTERVIEW_INTEGRITY_LOCK.release()
-        return {"skipped": True, "reason": "Another Feishu full scan is already running."}
-    try:
-        return sync_missing_interview_display_fields(Feishu(tenant_token()), Path("runtime"))
-    finally:
-        FEISHU_SCAN_LOCK.release()
-        INTERVIEW_INTEGRITY_LOCK.release()
+    return {
+        "mode": "disabled",
+        "records_updated": 0,
+        "reason": "Bulk interview display writes are disabled to protect active data entry.",
+    }
 
 
 def run_anchor_transfer_cycle() -> dict[str, object]:
@@ -786,7 +779,8 @@ def health() -> object:
             "contact_full_sync_enabled": os.environ.get("CONTACT_FULL_SYNC_ENABLED", "false").lower() == "true",
             "legacy_assignment_backfill_enabled": legacy_assignment_backfill_enabled(),
             "personnel_dropdown_sync_enabled": personnel_dropdown_sync_enabled(),
-            "interview_owner_and_date_group_repair_enabled": personnel_dropdown_sync_enabled(),
+            "interview_owner_and_date_group_repair_enabled": False,
+            "interview_bulk_writes_disabled": True,
             "reporting_sync_enabled": reporting_sync_enabled(),
             "anchor_maintenance_sync_enabled": anchor_maintenance_sync_enabled(),
             "mobile_form_configured": mobile_form_configured(),
@@ -801,7 +795,7 @@ def health() -> object:
             "last_personnel_provisioning": last_provisioning,
             "last_anchor_transfer": last_anchor_transfer,
             "anchor_transfer_wake_requested": anchor_transfer_wake_requested,
-            "schema_version": "2026-09-19-bidirectional-interview-followup-v14",
+            "schema_version": "2026-09-20-stable-interview-entry-v15",
             "active_batch": os.environ.get("AUTOMATION_ACTIVE_BATCH", ""),
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
