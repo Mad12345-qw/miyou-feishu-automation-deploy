@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 import sync_missing_personal_entries as personal
 import sync_missing_workbench_rows as workbench
-from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, desired_anchor_number, find_existing_anchor_for_interview, keep_existing_fields, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_management_summary, sync_one_anchor_followup_to_interviews, sync_one_interview_followup_to_anchors, sync_one_interview_personnel_assignment, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
+from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, desired_anchor_number, find_existing_anchor_for_interview, keep_existing_fields, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_management_summary, sync_one_anchor_followup_to_interviews, sync_one_anchor_operator_to_interviews, sync_one_interview_followup_to_anchors, sync_one_interview_operator_to_anchors, sync_one_interview_personnel_assignment, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
 from repair_live_data_integrity import CHILD_SPECS, plan_duplicate_child_cleanup
 
 
@@ -230,6 +230,54 @@ class SyncIntegrityTests(unittest.TestCase):
 
         self.assertEqual([], report["updated_fields"])
         self.assertEqual([], fs.updated)
+
+    def test_cleared_operator_display_also_clears_hidden_account(self) -> None:
+        class InterviewFeishu:
+            def __init__(self) -> None:
+                self.updated = []
+
+            def api(self, method, path, query=None, body=None):
+                return {
+                    "code": 0,
+                    "data": {
+                        "record": {
+                            "record_id": "rec-interview",
+                            "fields": {
+                                "对接运营": "",
+                                "对接运营账号（系统）": [{"id": USER_ID, "name": "测试运营"}],
+                                "关联主播档案": [],
+                            },
+                        }
+                    },
+                }
+
+            def list_records(self, table_id, page_size=500):
+                if table_id == TABLES["personnel"]:
+                    return [{
+                        "record_id": "rec-person",
+                        "fields": {
+                            "姓名": "测试运营",
+                            "飞书用户": [{"id": USER_ID}],
+                            "在职状态": "在职",
+                            "账号状态": "正常",
+                            "角色": ["对接运营"],
+                        },
+                    }]
+                return []
+
+            def fields(self, table_id):
+                return [{"field_name": "邀约日期（按天分组）", "type": 20}]
+
+            def batch_update(self, table_id, records, batch_size=500):
+                self.updated.extend(records)
+                return [{"code": 0}]
+
+        fs = InterviewFeishu()
+        with TemporaryDirectory() as directory:
+            report = sync_one_interview_personnel_assignment(fs, "rec-interview", Path(directory))
+
+        self.assertEqual(["对接运营账号（系统）"], report["updated_fields"])
+        self.assertEqual([], fs.updated[0]["fields"]["对接运营账号（系统）"])
 
     def test_interview_followup_does_not_write_when_anchor_already_matches(self) -> None:
         class FollowupFeishu:
@@ -611,7 +659,7 @@ class SyncIntegrityTests(unittest.TestCase):
         self.assertEqual(1, report["updated_records"])
         self.assertEqual([{"id": USER_ID}], fs.updates[0]["fields"]["面试官账号（系统）"])
 
-    def test_manual_anchor_operator_is_canonical_and_moves_default_owned_work(self) -> None:
+    def test_periodic_ownership_sync_does_not_infer_operator_direction(self) -> None:
         class OwnershipFeishu:
             def __init__(self) -> None:
                 self.updates = {}
@@ -650,16 +698,10 @@ class SyncIntegrityTests(unittest.TestCase):
 
         report = sync_linked_anchor_operators(fs, interviews)
 
-        self.assertEqual(1, report["operator_reassignments"])
-        self.assertNotIn(TABLES["anchor"], fs.updates)
-        self.assertEqual("运营乙", fs.updates[TABLES["interview"]][0]["fields"]["对接运营"])
-        self.assertEqual([{"id": "ou_new"}], fs.updates[TABLES["interview"]][0]["fields"]["对接运营账号（系统）"])
-        self.assertEqual("运营乙", fs.updates[TABLES["node"]][0]["fields"]["责任人"])
-        self.assertEqual([{"id": "ou_new"}], fs.updates[TABLES["task"]][0]["fields"]["运营经济人"])
-        self.assertEqual(["rec_task"], [row["record_id"] for row in fs.updates[TABLES["task"]]])
-        self.assertNotIn(TABLES["visual"], fs.updates)
+        self.assertEqual(0, report["operator_reassignments"])
+        self.assertEqual({}, fs.updates)
 
-    def test_interview_operator_fills_an_unassigned_anchor(self) -> None:
+    def test_periodic_ownership_sync_does_not_fill_unassigned_anchor_operator(self) -> None:
         class OwnershipFeishu:
             def __init__(self) -> None:
                 self.updates = {}
@@ -679,7 +721,116 @@ class SyncIntegrityTests(unittest.TestCase):
         report = sync_linked_anchor_operators(fs, interviews)
 
         self.assertEqual(0, report["operator_reassignments"])
-        self.assertEqual([{"id": "ou_new"}], fs.updates[TABLES["anchor"]][0]["fields"]["运营经济人"])
+        self.assertEqual({}, fs.updates)
+
+    def test_explicit_interview_clear_removes_linked_anchor_operator(self) -> None:
+        class OwnershipFeishu:
+            def __init__(self) -> None:
+                self.updates = {}
+
+            def api(self, method, path, query=None, body=None):
+                return {
+                    "code": 0,
+                    "data": {
+                        "record": {
+                            "record_id": "rec_anchor",
+                            "fields": {"运营经济人": [{"id": "ou_old", "name": "运营甲"}]},
+                        }
+                    },
+                }
+
+            def list_records(self, table_id, page_size=500):
+                return []
+
+            def batch_update(self, table_id, records, batch_size=100):
+                self.updates.setdefault(table_id, []).extend(records)
+                return [{"code": 0}]
+
+        fs = OwnershipFeishu()
+        report = sync_one_interview_operator_to_anchors(
+            fs,
+            {
+                "record_id": "rec_interview",
+                "fields": {
+                    "关联主播档案": ["rec_anchor"],
+                    "对接运营": "",
+                    "对接运营账号（系统）": [],
+                },
+            },
+        )
+
+        self.assertEqual(1, report["updated_anchors"])
+        self.assertEqual([], fs.updates[TABLES["anchor"]][0]["fields"]["运营经济人"])
+
+    def test_explicit_anchor_reassignment_updates_linked_interview(self) -> None:
+        class OwnershipFeishu:
+            def __init__(self) -> None:
+                self.updates = {}
+
+            def api(self, method, path, query=None, body=None):
+                return {
+                    "code": 0,
+                    "data": {
+                        "record": {
+                            "record_id": "rec_interview",
+                            "fields": {
+                                "对接运营": "运营甲",
+                                "对接运营账号（系统）": [{"id": "ou_old"}],
+                            },
+                        }
+                    },
+                }
+
+            def list_records(self, table_id, page_size=500):
+                if table_id == TABLES["personnel"]:
+                    return [{"record_id": "rec_person", "fields": {"姓名": "运营乙", "飞书用户": [{"id": "ou_new"}]}}]
+                return []
+
+            def batch_update(self, table_id, records, batch_size=100):
+                self.updates.setdefault(table_id, []).extend(records)
+                return [{"code": 0}]
+
+        fs = OwnershipFeishu()
+        report = sync_one_anchor_operator_to_interviews(
+            fs,
+            {
+                "record_id": "rec_anchor",
+                "fields": {
+                    "来源面试记录": ["rec_interview"],
+                    "运营经济人": [{"id": "ou_new"}],
+                },
+            },
+        )
+
+        self.assertEqual(1, report["updated_interviews"])
+        fields = fs.updates[TABLES["interview"]][0]["fields"]
+        self.assertEqual("运营乙", fields["对接运营"])
+        self.assertEqual([{"id": "ou_new"}], fields["对接运营账号（系统）"])
+
+    def test_unresolved_visible_operator_does_not_clear_anchor(self) -> None:
+        class OwnershipFeishu:
+            def __init__(self) -> None:
+                self.updates = []
+
+            def batch_update(self, table_id, records, batch_size=100):
+                self.updates.extend(records)
+                return [{"code": 0}]
+
+        fs = OwnershipFeishu()
+        report = sync_one_interview_operator_to_anchors(
+            fs,
+            {
+                "record_id": "rec_interview",
+                "fields": {
+                    "关联主播档案": ["rec_anchor"],
+                    "对接运营": "未识别人员",
+                    "对接运营账号（系统）": [],
+                },
+            },
+        )
+
+        self.assertEqual("unresolved_visible_operator", report["skipped"])
+        self.assertEqual([], fs.updates)
 
     def test_periodic_ownership_sync_does_not_overwrite_anchor_followup(self) -> None:
         class OwnershipFeishu:

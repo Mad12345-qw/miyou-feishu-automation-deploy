@@ -82,6 +82,35 @@ class FeishuLongConnectionTests(unittest.TestCase):
         self.assertEqual(["rec-a", "rec-b"], enqueue.call_args.args[3])
         self.assertEqual("long_connection", enqueue.call_args.args[4])
 
+    def test_interview_event_updates_linked_anchor_operator(self) -> None:
+        fs = object()
+        interview = {"record_id": "rec-interview", "fields": {"关联主播档案": ["rec-anchor"]}}
+        with (
+            patch.object(
+                service,
+                "sync_one_interview_personnel_assignment",
+                return_value={"updated_fields": ["对接运营账号（系统）"]},
+            ) as personnel_sync,
+            patch.object(service, "read_record", return_value=interview) as read,
+            patch.object(
+                service,
+                "sync_one_interview_operator_to_anchors",
+                return_value={"updated_anchors": 1},
+            ) as operator_sync,
+            patch.object(service, "trigger_anchor_transfer_async", return_value=True),
+        ):
+            result = service.process_feishu_record_change(
+                fs,
+                service.TABLES["interview"],
+                "rec-interview",
+                "long_connection",
+            )
+
+        personnel_sync.assert_called_once()
+        read.assert_called_once_with(fs, service.TABLES["interview"], "rec-interview")
+        operator_sync.assert_called_once_with(fs, interview)
+        self.assertEqual(["对接运营账号（系统）", "03运营经济人"], result["updated"])
+
     def test_anchor_event_updates_linked_interview_followup(self) -> None:
         fs = object()
         anchor = {"record_id": "rec-anchor", "fields": {"来源面试记录": ["rec-interview"]}}
@@ -93,6 +122,11 @@ class FeishuLongConnectionTests(unittest.TestCase):
                 "sync_one_anchor_followup_to_interviews",
                 return_value={"updated_interviews": 1},
             ) as followup_sync,
+            patch.object(
+                service,
+                "sync_one_anchor_operator_to_interviews",
+                return_value={"updated_interviews": 1},
+            ) as operator_sync,
         ):
             result = service.process_feishu_record_change(
                 fs,
@@ -104,7 +138,8 @@ class FeishuLongConnectionTests(unittest.TestCase):
         number_sync.assert_called_once()
         read.assert_called_once_with(fs, service.TABLES["anchor"], "rec-anchor")
         followup_sync.assert_called_once_with(fs, anchor)
-        self.assertEqual(["面试跟进情况（日更）"], result["updated"])
+        operator_sync.assert_called_once_with(fs, anchor)
+        self.assertEqual(["面试跟进情况（日更）", "02对接运营"], result["updated"])
 
     def test_other_base_is_not_queued(self) -> None:
         result = service.enqueue_feishu_record_changes(

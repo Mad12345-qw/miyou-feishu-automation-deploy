@@ -11,7 +11,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 
 from mobile_interview_form import register_mobile_interview_form
-from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, read_record, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_anchor_numbers, sync_one_anchor_followup_to_interviews, sync_one_anchor_number, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory, sync_recent_interview_assignments
+from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, read_record, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_anchor_numbers, sync_one_anchor_followup_to_interviews, sync_one_anchor_number, sync_one_anchor_operator_to_interviews, sync_one_interview_operator_to_anchors, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory, sync_recent_interview_assignments
 from run_miyou_rule_engine import reconcile
 from sync_missing_personal_entries import sync_missing_personal_entries
 from sync_missing_workbench_rows import sync_missing_workbench_rows
@@ -619,18 +619,26 @@ def process_feishu_record_change(
     """Run the narrow maintenance required for one changed Base record."""
     if table_id == TABLES["interview"]:
         result = sync_one_interview_personnel_assignment(fs, record_id, Path("runtime"))
-        updated = result.get("updated_fields", {})
+        interview = read_record(fs, TABLES["interview"], record_id)
+        operator_result = sync_one_interview_operator_to_anchors(fs, interview)
+        result["operator_sync"] = operator_result
+        updated = list(result.get("updated_fields", []))
+        if operator_result.get("updated_anchors"):
+            updated.append("03运营经济人")
         trigger_anchor_transfer_async(f"Feishu interview event via {transport}")
     else:
         number_result = sync_one_anchor_number(fs, record_id, Path("runtime"))
         anchor = read_record(fs, TABLES["anchor"], record_id)
         followup_result = sync_one_anchor_followup_to_interviews(fs, anchor)
-        result = {"number": number_result, "followup_sync": followup_result}
+        operator_result = sync_one_anchor_operator_to_interviews(fs, anchor)
+        result = {"number": number_result, "followup_sync": followup_result, "operator_sync": operator_result}
         updated = []
         if number_result.get("updated"):
             updated.append("主播编号")
         if followup_result.get("updated_interviews"):
             updated.append("面试跟进情况（日更）")
+        if operator_result.get("updated_interviews"):
+            updated.append("02对接运营")
     return {"result": result, "updated": updated}
 
 

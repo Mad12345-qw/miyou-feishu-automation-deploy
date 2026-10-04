@@ -1089,8 +1089,130 @@ def sync_one_anchor_followup_to_interviews(fs: Feishu, anchor: dict[str, Any]) -
     }
 
 
+def personnel_name_by_user_id(fs: Feishu) -> dict[str, str]:
+    return {
+        user_id: text_value((person.get("fields") or {}).get("姓名")).strip()
+        for person in fs.list_records(TABLES["personnel"], page_size=500)
+        for user_id in user_ids((person.get("fields") or {}).get("飞书用户"))
+    }
+
+
+def sync_one_interview_operator_to_anchors(fs: Feishu, interview: dict[str, Any]) -> dict[str, Any]:
+    """Mirror one explicit 02 operator edit to linked 03 profiles, including clears."""
+    interview_id = str(interview.get("record_id") or "")
+    fields = interview.get("fields") or {}
+    linked_ids = list(dict.fromkeys(linked_record_ids(fields.get("关联主播档案"))))
+    visible_name = text_value(fields.get("对接运营")).strip()
+    desired_ids = user_ids(fields.get("对接运营账号（系统）"))
+    if visible_name and not desired_ids:
+        return {
+            "interview_record_id": interview_id,
+            "linked_anchors": len(linked_ids),
+            "updated_anchors": 0,
+            "skipped": "unresolved_visible_operator",
+        }
+
+    updates: list[dict[str, Any]] = []
+    reassignments: list[dict[str, Any]] = []
+    missing_anchor_ids: list[str] = []
+    for anchor_id in linked_ids:
+        try:
+            anchor = read_record(fs, TABLES["anchor"], anchor_id)
+        except RuntimeError:
+            missing_anchor_ids.append(anchor_id)
+            continue
+        anchor_fields = anchor.get("fields") or {}
+        current_ids = user_ids(anchor_fields.get("运营经济人"))
+        if set(current_ids) == set(desired_ids):
+            continue
+        updates.append(
+            {
+                "record_id": anchor_id,
+                "fields": {"运营经济人": [{"id": user_id} for user_id in desired_ids]},
+            }
+        )
+        reassignments.append(
+            {
+                "anchor_id": anchor_id,
+                "old_ids": current_ids,
+                "old_names": owner_names(anchor_fields.get("运营经济人")),
+                "new_ids": desired_ids,
+                "new_name": visible_name,
+            }
+        )
+    results = fs.batch_update(TABLES["anchor"], updates, batch_size=100) if updates else []
+    dependent_sync = sync_reassigned_anchor_dependents(fs, reassignments)
+    return {
+        "interview_record_id": interview_id,
+        "linked_anchors": len(linked_ids),
+        "updated_anchors": len(updates),
+        "missing_anchor_ids": missing_anchor_ids,
+        "dependent_sync": dependent_sync,
+        "results": results,
+    }
+
+
+def sync_one_anchor_operator_to_interviews(fs: Feishu, anchor: dict[str, Any]) -> dict[str, Any]:
+    """Mirror one explicit 03 operator edit to source 02 rows, including clears."""
+    anchor_id = str(anchor.get("record_id") or "")
+    fields = anchor.get("fields") or {}
+    interview_ids = list(dict.fromkeys(linked_record_ids(fields.get("来源面试记录"))))
+    desired_ids = user_ids(fields.get("运营经济人"))
+    names_by_id = personnel_name_by_user_id(fs) if desired_ids else {}
+    desired_name = text_value(fields.get("运营经济人")).strip() or "、".join(
+        names_by_id.get(user_id, "") for user_id in desired_ids
+    ).strip("、")
+    updates: list[dict[str, Any]] = []
+    old_ids: list[str] = []
+    old_names: set[str] = set()
+    missing_interview_ids: list[str] = []
+    for interview_id in interview_ids:
+        try:
+            interview = read_record(fs, TABLES["interview"], interview_id)
+        except RuntimeError:
+            missing_interview_ids.append(interview_id)
+            continue
+        interview_fields = interview.get("fields") or {}
+        current_ids = user_ids(interview_fields.get("对接运营账号（系统）"))
+        old_ids.extend(user_id for user_id in current_ids if user_id not in old_ids)
+        old_names.update(
+            owner_names(
+                interview_fields.get("对接运营"),
+                interview_fields.get("对接运营账号（系统）"),
+            )
+        )
+        changed: dict[str, Any] = {}
+        if set(current_ids) != set(desired_ids):
+            changed["对接运营账号（系统）"] = [{"id": user_id} for user_id in desired_ids]
+        if text_value(interview_fields.get("对接运营")).strip() != desired_name:
+            changed["对接运营"] = desired_name
+        if changed:
+            updates.append({"record_id": interview_id, "fields": changed})
+    results = fs.batch_update(TABLES["interview"], updates, batch_size=100) if updates else []
+    reassignments = []
+    if updates:
+        reassignments.append(
+            {
+                "anchor_id": anchor_id,
+                "old_ids": old_ids,
+                "old_names": sorted(old_names),
+                "new_ids": desired_ids,
+                "new_name": desired_name,
+            }
+        )
+    dependent_sync = sync_reassigned_anchor_dependents(fs, reassignments)
+    return {
+        "anchor_record_id": anchor_id,
+        "linked_interviews": len(interview_ids),
+        "updated_interviews": len(updates),
+        "missing_interview_ids": missing_interview_ids,
+        "dependent_sync": dependent_sync,
+        "results": results,
+    }
+
+
 def sync_linked_anchor_operators(fs: Feishu, records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Keep ownership aligned without overwriting post-hire operator changes."""
+    """Keep recruiter/interviewer aligned; operator edits are event-driven only."""
     assignment_fields = {
         "招募人账号（系统）": "招募经济人",
         "面试官账号（系统）": "面试官",
@@ -1119,76 +1241,31 @@ def sync_linked_anchor_operators(fs: Feishu, records: list[dict[str, Any]]) -> d
         **{field_name: 0 for field_name in assignment_fields.values()},
         "运营经济人": 0,
     }
-    interview_updates: list[dict[str, Any]] = []
-    operator_reassignments: list[dict[str, Any]] = []
-    people_by_id = {
-        user_id: text_value((person.get("fields") or {}).get("姓名")).strip()
-        for person in fs.list_records(TABLES["personnel"], page_size=500)
-        for user_id in user_ids((person.get("fields") or {}).get("飞书用户"))
-    }
     for anchor_id, (interview, desired) in assignments.items():
         anchor = anchors_by_id.get(anchor_id)
         if not anchor:
             continue
         current = anchor.get("fields") or {}
-        interview_fields = interview.get("fields") or {}
         changed = {
             field_name: users
             for field_name, users in desired.items()
             if set(user_ids(current.get(field_name))) != set(user_ids(users))
         }
-        # After a streamer profile exists, reassignment happens on that profile.
-        # The interview is historical input and must not overwrite a later change.
-        anchor_operator = current.get("运营经济人") or []
-        anchor_operator_ids = user_ids(anchor_operator)
-        interview_operator_ids = user_ids(interview_fields.get("对接运营账号（系统）"))
-        if anchor_operator_ids:
-            operator_name = text_value(anchor_operator).strip() or "、".join(
-                people_by_id.get(user_id, "") for user_id in anchor_operator_ids
-            ).strip("、")
-            interview_changed: dict[str, Any] = {}
-            if set(interview_operator_ids) != set(anchor_operator_ids):
-                interview_changed["对接运营账号（系统）"] = [
-                    {"id": user_id} for user_id in anchor_operator_ids
-                ]
-            if operator_name and text_value(interview_fields.get("对接运营")).strip() != operator_name:
-                interview_changed["对接运营"] = operator_name
-            if interview_changed:
-                interview_updates.append(
-                    {"record_id": interview["record_id"], "fields": interview_changed}
-                )
-            if set(interview_operator_ids) != set(anchor_operator_ids):
-                operator_reassignments.append(
-                    {
-                        "anchor_id": anchor_id,
-                        "old_ids": interview_operator_ids,
-                        "old_names": owner_names(interview_fields.get("对接运营"), interview_fields.get("对接运营账号（系统）")),
-                        "new_ids": anchor_operator_ids,
-                        "new_name": operator_name,
-                    }
-                )
-        elif interview_operator_ids:
-            changed["运营经济人"] = [
-                {"id": user_id} for user_id in interview_operator_ids
-            ]
-
         if changed:
             updates.append({"record_id": anchor_id, "fields": changed})
             for field_name in changed:
                 updated_fields[field_name] += 1
     anchor_results = fs.batch_update(TABLES["anchor"], updates, batch_size=100) if updates else []
-    interview_results = fs.batch_update(TABLES["interview"], interview_updates, batch_size=100) if interview_updates else []
-    dependent_sync = sync_reassigned_anchor_dependents(fs, operator_reassignments)
     return {
         "checked_assignments": len(assignments),
         "updated": len(updates),
         "updated_fields": updated_fields,
-        "updated_interviews": len(interview_updates),
-        "operator_reassignments": len(operator_reassignments),
-        "dependent_sync": dependent_sync,
+        "updated_interviews": 0,
+        "operator_reassignments": 0,
+        "dependent_sync": {"checked_anchors": 0, "updated": {}},
         "missing_linked_anchor_ids": missing_ids,
         "results": anchor_results,
-        "interview_results": interview_results,
+        "interview_results": [],
     }
 
 
@@ -2822,12 +2899,16 @@ def sync_one_interview_personnel_assignment(fs: Feishu, record_id: str, out_dir:
         account_name = str(spec["account_field"])
         existing_ids = user_ids(fields.get(account_name))
         if not selected:
+            if visible_name == "对接运营" and existing_ids:
+                changed[account_name] = []
             continue
         users = people_by_name.get(selected)
         if not users and visible_name == "招募人":
             users = self_selected_creator_users(fields, selected)
         if not users:
             unresolved.append(selected)
+            if visible_name == "对接运营" and existing_ids:
+                changed[account_name] = []
             continue
         if existing_ids != user_ids(users):
             changed[account_name] = users
