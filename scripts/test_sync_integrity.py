@@ -659,6 +659,78 @@ class SyncIntegrityTests(unittest.TestCase):
         self.assertEqual(1, report["updated_records"])
         self.assertEqual([{"id": USER_ID}], fs.updates[0]["fields"]["面试官账号（系统）"])
 
+    def test_periodic_assignment_clears_blocked_operator_before_interview(self) -> None:
+        class AssignmentFeishu:
+            def __init__(self) -> None:
+                self.updates = []
+
+            def list_records(self, table_id, page_size=500):
+                return []
+
+            def batch_update(self, table_id, records, batch_size=100):
+                self.updates.extend(records)
+                return [{"code": 0}]
+
+        fs = AssignmentFeishu()
+        report = sync_selected_interview_assignments(
+            fs,
+            [{
+                "record_id": "rec_interview",
+                "fields": {
+                    "候选人姓名": "候选人甲",
+                    "邀约时间": 1,
+                    "对接运营": ["耿艳丽"],
+                    "对接运营账号（系统）": [{"id": "ou_default"}],
+                    "关联主播档案": [],
+                    "通过转入主播": False,
+                },
+            }],
+        )
+
+        self.assertEqual(1, report["cleared_premature_operators"])
+        self.assertEqual([], fs.updates[0]["fields"]["对接运营"])
+        self.assertEqual([], fs.updates[0]["fields"]["对接运营账号（系统）"])
+
+    def test_periodic_assignment_preserves_blocked_operator_after_interview(self) -> None:
+        class AssignmentFeishu:
+            def __init__(self) -> None:
+                self.updates = []
+
+            def list_records(self, table_id, page_size=500):
+                if table_id == TABLES["personnel"]:
+                    return [{
+                        "record_id": "rec_person",
+                        "fields": {
+                            "姓名": "耿艳丽",
+                            "飞书用户": [{"id": "ou_operator"}],
+                            "在职状态": "在职",
+                            "账号状态": "正常",
+                        },
+                    }]
+                return []
+
+            def batch_update(self, table_id, records, batch_size=100):
+                self.updates.extend(records)
+                return [{"code": 0}]
+
+        fs = AssignmentFeishu()
+        report = sync_selected_interview_assignments(
+            fs,
+            [{
+                "record_id": "rec_interview",
+                "fields": {
+                    "候选人姓名": "候选人甲",
+                    "面试状态": "已完成",
+                    "对接运营": ["耿艳丽"],
+                    "对接运营账号（系统）": [],
+                    "关联主播档案": [],
+                },
+            }],
+        )
+
+        self.assertEqual(0, report["cleared_premature_operators"])
+        self.assertEqual([{"id": "ou_operator"}], fs.updates[0]["fields"]["对接运营账号（系统）"])
+
     def test_periodic_ownership_sync_does_not_infer_operator_direction(self) -> None:
         class OwnershipFeishu:
             def __init__(self) -> None:
@@ -806,6 +878,56 @@ class SyncIntegrityTests(unittest.TestCase):
         fields = fs.updates[TABLES["interview"]][0]["fields"]
         self.assertEqual("运营乙", fields["对接运营"])
         self.assertEqual([{"id": "ou_new"}], fields["对接运营账号（系统）"])
+
+    def test_anchor_reassignment_writes_multi_select_operator_as_a_list(self) -> None:
+        class OwnershipFeishu:
+            def __init__(self) -> None:
+                self.updates = {}
+
+            def fields(self, table_id):
+                return [{"field_name": "对接运营", "type": 4}]
+
+            def api(self, method, path, query=None, body=None):
+                return {
+                    "code": 0,
+                    "data": {
+                        "record": {
+                            "record_id": "rec_interview",
+                            "fields": {
+                                "对接运营": ["运营甲"],
+                                "对接运营账号（系统）": [{"id": "ou_old"}],
+                            },
+                        }
+                    },
+                }
+
+            def list_records(self, table_id, page_size=500):
+                if table_id == TABLES["personnel"]:
+                    return [
+                        {"record_id": "rec_a", "fields": {"姓名": "运营乙", "飞书用户": [{"id": "ou_b"}]}},
+                        {"record_id": "rec_b", "fields": {"姓名": "运营丙", "飞书用户": [{"id": "ou_c"}]}},
+                    ]
+                return []
+
+            def batch_update(self, table_id, records, batch_size=100):
+                self.updates.setdefault(table_id, []).extend(records)
+                return [{"code": 0}]
+
+        fs = OwnershipFeishu()
+        sync_one_anchor_operator_to_interviews(
+            fs,
+            {
+                "record_id": "rec_anchor",
+                "fields": {
+                    "来源面试记录": ["rec_interview"],
+                    "运营经济人": [{"id": "ou_b"}, {"id": "ou_c"}],
+                },
+            },
+        )
+
+        fields = fs.updates[TABLES["interview"]][0]["fields"]
+        self.assertEqual(["运营乙", "运营丙"], fields["对接运营"])
+        self.assertEqual([{"id": "ou_b"}, {"id": "ou_c"}], fields["对接运营账号（系统）"])
 
     def test_unresolved_visible_operator_does_not_clear_anchor(self) -> None:
         class OwnershipFeishu:

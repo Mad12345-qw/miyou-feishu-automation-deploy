@@ -439,6 +439,52 @@ def list_value(value: Any) -> list[str]:
     return [text_value(value).strip()]
 
 
+def interview_is_completed(fields: dict[str, Any]) -> bool:
+    return bool(fields.get("面试开始时间") or fields.get("面试结束时间")) or text_value(
+        fields.get("面试状态")
+    ).strip() in {"已完成", "已面试"}
+
+
+def blocked_preinterview_operator_names() -> set[str]:
+    raw = os.environ.get("BLOCK_PREINTERVIEW_OPERATOR_NAMES", "耿艳丽")
+    return {
+        name.strip()
+        for name in raw.replace("，", "、").replace(",", "、").split("、")
+        if name.strip()
+    }
+
+
+def should_clear_premature_operator(fields: dict[str, Any]) -> bool:
+    selected_names = set(list_value(fields.get("对接运营")))
+    if not selected_names.intersection(blocked_preinterview_operator_names()):
+        return False
+    if interview_is_completed(fields):
+        return False
+    if linked_record_ids(fields.get("关联主播档案")):
+        return False
+    return not bool(
+        fields.get(TRANSFER_TO_ANCHOR_FIELD) is True
+        or fields.get(LEGACY_TRANSFER_TO_ANCHOR_FIELD) is True
+    )
+
+
+def cleared_select_value(value: Any) -> Any:
+    return [] if isinstance(value, list) else ""
+
+
+def interview_operator_field_type(fs: Feishu, current_value: Any = None) -> int:
+    try:
+        field = next(
+            (item for item in fs.fields(TABLES["interview"]) if item.get("field_name") == "对接运营"),
+            None,
+        )
+        if field and field.get("type") in {FIELD_TYPES["single_select"], FIELD_TYPES["multi_select"]}:
+            return int(field["type"])
+    except (AttributeError, RuntimeError):
+        pass
+    return FIELD_TYPES["multi_select"] if isinstance(current_value, list) else FIELD_TYPES["single_select"]
+
+
 def phone_value(value: Any) -> str:
     text = text_value(value).strip()
     if not text:
@@ -979,26 +1025,48 @@ def sync_selected_interview_assignments(fs: Feishu, records: list[dict[str, Any]
     }
     updates: list[dict[str, Any]] = []
     unresolved: set[str] = set()
+    cleared_premature_operators = 0
     for record in records:
         fields = record.get("fields") or {}
         changed: dict[str, Any] = {}
         for visible_name, spec in INTERVIEW_PERSONNEL_DROPDOWNS.items():
-            selected = text_value(fields.get(visible_name)).strip()
-            if not selected:
+            selected_names = list_value(fields.get(visible_name))
+            if visible_name == "对接运营" and should_clear_premature_operator(fields):
+                changed[visible_name] = cleared_select_value(fields.get(visible_name))
+                changed[str(spec["account_field"])] = []
+                fields[visible_name] = changed[visible_name]
+                fields[str(spec["account_field"])] = []
+                cleared_premature_operators += 1
+                continue
+            if not selected_names:
                 continue
             account_name = str(spec["account_field"])
             current_user_ids = user_ids(fields.get(account_name))
-            users = people.get(selected)
-            if not users:
+            selected_users: list[dict[str, str]] = []
+            missing_names: list[str] = []
+            for selected in selected_names:
+                users = people.get(selected)
+                if not users:
+                    missing_names.append(selected)
+                    continue
+                for user in users:
+                    if user["id"] not in {item["id"] for item in selected_users}:
+                        selected_users.append(user)
+            if missing_names:
                 if not current_user_ids:
-                    unresolved.add(selected)
+                    unresolved.update(missing_names)
                 continue
-            if current_user_ids != user_ids(users):
-                changed[account_name] = users
-                fields[account_name] = users
+            if current_user_ids != user_ids(selected_users):
+                changed[account_name] = selected_users
+                fields[account_name] = selected_users
         if changed:
             updates.append({"record_id": record["record_id"], "fields": changed})
-    return {"updated_records": len(updates), "unresolved_values": sorted(unresolved), "results": fs.batch_update(TABLES["interview"], updates, batch_size=100) if updates else []}
+    return {
+        "updated_records": len(updates),
+        "cleared_premature_operators": cleared_premature_operators,
+        "unresolved_values": sorted(unresolved),
+        "results": fs.batch_update(TABLES["interview"], updates, batch_size=100) if updates else [],
+    }
 
 
 def sync_recent_interview_assignments(fs: Feishu, limit: int = 500) -> dict[str, Any]:
@@ -1159,9 +1227,12 @@ def sync_one_anchor_operator_to_interviews(fs: Feishu, anchor: dict[str, Any]) -
     interview_ids = list(dict.fromkeys(linked_record_ids(fields.get("来源面试记录"))))
     desired_ids = user_ids(fields.get("运营经济人"))
     names_by_id = personnel_name_by_user_id(fs) if desired_ids else {}
-    desired_name = text_value(fields.get("运营经济人")).strip() or "、".join(
-        names_by_id.get(user_id, "") for user_id in desired_ids
-    ).strip("、")
+    desired_names = [names_by_id.get(user_id, "") for user_id in desired_ids]
+    desired_names = [name for name in desired_names if name]
+    if not desired_names:
+        desired_names = list_value(fields.get("运营经济人"))
+    desired_name = "、".join(desired_names)
+    operator_field_type = interview_operator_field_type(fs)
     updates: list[dict[str, Any]] = []
     old_ids: list[str] = []
     old_names: set[str] = set()
@@ -1184,8 +1255,14 @@ def sync_one_anchor_operator_to_interviews(fs: Feishu, anchor: dict[str, Any]) -
         changed: dict[str, Any] = {}
         if set(current_ids) != set(desired_ids):
             changed["对接运营账号（系统）"] = [{"id": user_id} for user_id in desired_ids]
-        if text_value(interview_fields.get("对接运营")).strip() != desired_name:
-            changed["对接运营"] = desired_name
+        current_visible = interview_fields.get("对接运营")
+        desired_visible: Any = (
+            desired_names
+            if operator_field_type == FIELD_TYPES["multi_select"]
+            else desired_name
+        )
+        if list_value(current_visible) != list_value(desired_visible):
+            changed["对接运营"] = desired_visible
         if changed:
             updates.append({"record_id": interview_id, "fields": changed})
     results = fs.batch_update(TABLES["interview"], updates, batch_size=100) if updates else []
@@ -2500,8 +2577,11 @@ def sync_interview_personnel_dropdowns(fs: Feishu, out_dir: Path, sync_records: 
                 raise RuntimeError(f"Failed to create {visible_name} dropdown: {response}")
             fields_by_name = {field.get("field_name"): field for field in fs.fields(table_id)}
             visible_field = fields_by_name.get(visible_name)
-        if not visible_field or visible_field.get("type") != FIELD_TYPES["single_select"]:
-            raise RuntimeError(f"{visible_name} must be a single-select field after schema upgrade: {visible_field}")
+        allowed_types = {FIELD_TYPES["single_select"]}
+        if visible_name == "对接运营":
+            allowed_types.add(FIELD_TYPES["multi_select"])
+        if not visible_field or visible_field.get("type") not in allowed_types:
+            raise RuntimeError(f"{visible_name} must be a supported select field after schema upgrade: {visible_field}")
 
     dropdown_people: dict[str, dict[str, list[dict[str, str]]]] = {}
     input_people: dict[str, dict[str, list[dict[str, str]]]] = {}
@@ -2895,23 +2975,38 @@ def sync_one_interview_personnel_assignment(fs: Feishu, record_id: str, out_dir:
     changed: dict[str, Any] = {}
     unresolved: list[str] = []
     for visible_name, spec in INTERVIEW_PERSONNEL_DROPDOWNS.items():
-        selected = text_value(fields.get(visible_name)).strip()
+        selected_names = list_value(fields.get(visible_name))
         account_name = str(spec["account_field"])
         existing_ids = user_ids(fields.get(account_name))
-        if not selected:
+        if visible_name == "对接运营" and should_clear_premature_operator(fields):
+            changed[visible_name] = cleared_select_value(fields.get(visible_name))
+            changed[account_name] = []
+            fields[visible_name] = changed[visible_name]
+            fields[account_name] = []
+            continue
+        if not selected_names:
             if visible_name == "对接运营" and existing_ids:
                 changed[account_name] = []
             continue
-        users = people_by_name.get(selected)
-        if not users and visible_name == "招募人":
-            users = self_selected_creator_users(fields, selected)
-        if not users:
-            unresolved.append(selected)
+        selected_users: list[dict[str, str]] = []
+        missing_names: list[str] = []
+        for selected in selected_names:
+            users = people_by_name.get(selected)
+            if not users and visible_name == "招募人":
+                users = self_selected_creator_users(fields, selected)
+            if not users:
+                missing_names.append(selected)
+                continue
+            for user in users:
+                if user["id"] not in {item["id"] for item in selected_users}:
+                    selected_users.append(user)
+        if missing_names:
+            unresolved.extend(missing_names)
             if visible_name == "对接运营" and existing_ids:
                 changed[account_name] = []
             continue
-        if existing_ids != user_ids(users):
-            changed[account_name] = users
+        if existing_ids != user_ids(selected_users):
+            changed[account_name] = selected_users
     visible_recruiter = text_value(fields.get("招募人")).strip()
     hidden_recruiter_ids = user_ids(fields.get("招募人账号（系统）"))
     if not visible_recruiter and not hidden_recruiter_ids:
