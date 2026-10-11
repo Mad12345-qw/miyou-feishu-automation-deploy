@@ -12,7 +12,7 @@ from typing import Any
 from miyou_system_automation import APP_TOKEN, Feishu, TABLES, get_tenant_token, list_value, text_value, user_ids, write_json
 
 
-WORKBENCH_TABLE = os.environ.get("FEISHU_WORKBENCH_TABLE_ID", "").strip()
+WORKBENCH_TABLE = os.environ.get("FEISHU_WORKBENCH_TABLE_ID", "tblIcblT5703VGvp").strip()
 VIEW_READ_LOCK = threading.Lock()
 VIEW_READ_LAST_AT = 0.0
 
