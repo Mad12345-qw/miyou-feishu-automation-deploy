@@ -1053,6 +1053,13 @@ def sync_selected_interview_assignments(fs: Feishu, records: list[dict[str, Any]
                     if user["id"] not in {item["id"] for item in selected_users}:
                         selected_users.append(user)
             if missing_names:
+                if visible_name == "对接运营" and current_user_ids:
+                    visible_names = normalized_owner_names(selected_names)
+                    hidden_names = normalized_owner_names(fields.get(account_name))
+                    if hidden_names and visible_names.isdisjoint(hidden_names):
+                        changed[account_name] = []
+                        fields[account_name] = []
+                        current_user_ids = []
                 if not current_user_ids:
                     unresolved.update(missing_names)
                 continue

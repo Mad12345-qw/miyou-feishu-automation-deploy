@@ -731,6 +731,66 @@ class SyncIntegrityTests(unittest.TestCase):
         self.assertEqual(0, report["cleared_premature_operators"])
         self.assertEqual([{"id": "ou_operator"}], fs.updates[0]["fields"]["对接运营账号（系统）"])
 
+    def test_periodic_assignment_clears_stale_hidden_operator_for_unresolved_visible_name(self) -> None:
+        class AssignmentFeishu:
+            def __init__(self) -> None:
+                self.updates = []
+
+            def list_records(self, table_id, page_size=500):
+                return []
+
+            def batch_update(self, table_id, records, batch_size=100):
+                self.updates.extend(records)
+                return [{"code": 0}]
+
+        fs = AssignmentFeishu()
+        report = sync_selected_interview_assignments(
+            fs,
+            [{
+                "record_id": "rec_interview",
+                "fields": {
+                    "候选人姓名": "张友琼",
+                    "面试状态": "已完成",
+                    "对接运营": ["洛安"],
+                    "对接运营账号（系统）": [{"id": "ou_old", "name": "耿艳丽"}],
+                },
+            }],
+        )
+
+        self.assertEqual(1, report["updated_records"])
+        self.assertEqual(["洛安"], report["unresolved_values"])
+        self.assertEqual([], fs.updates[0]["fields"]["对接运营账号（系统）"])
+
+    def test_periodic_assignment_preserves_matching_external_operator_account(self) -> None:
+        class AssignmentFeishu:
+            def __init__(self) -> None:
+                self.updates = []
+
+            def list_records(self, table_id, page_size=500):
+                return []
+
+            def batch_update(self, table_id, records, batch_size=100):
+                self.updates.extend(records)
+                return [{"code": 0}]
+
+        fs = AssignmentFeishu()
+        report = sync_selected_interview_assignments(
+            fs,
+            [{
+                "record_id": "rec_interview",
+                "fields": {
+                    "候选人姓名": "张友琼",
+                    "面试状态": "已完成",
+                    "对接运营": ["洛安"],
+                    "对接运营账号（系统）": [{"id": "ou_luoan", "name": "洛安"}],
+                },
+            }],
+        )
+
+        self.assertEqual(0, report["updated_records"])
+        self.assertEqual([], report["unresolved_values"])
+        self.assertEqual([], fs.updates)
+
     def test_periodic_ownership_sync_does_not_infer_operator_direction(self) -> None:
         class OwnershipFeishu:
             def __init__(self) -> None:
