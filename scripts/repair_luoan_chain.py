@@ -10,8 +10,10 @@ from miyou_system_automation import (
     APP_TOKEN,
     Feishu,
     TABLES,
+    dependent_assignment_is_closed,
     get_tenant_token,
     read_record,
+    sync_reassigned_anchor_dependents,
     sync_one_anchor_operator_to_interviews,
     text_value,
     user_ids,
@@ -25,6 +27,16 @@ NAME = "洛安"
 OPEN_ID = "ou_e4370b95f37f316789e01f1a3437b1d0"
 INTERVIEW_ID = "reczz28KnLcXJx0W"
 ANCHOR_ID = "reczz28LHDHD7ae4"
+OLD_OPERATOR_ID = "ou_85115ae03c9381041124f661516c7157"
+OLD_OPERATOR_NAME = "耿艳丽"
+DEPENDENT_SPECS = {
+    "node": ("关联主播", ("责任人",)),
+    "task": ("对应主播", ("负责人", "运营经济人")),
+    "visual": ("关联主播", ("提交运营",)),
+    "training": ("关联主播", ("培训运营",)),
+    "first_live": ("关联主播", ("跟播运营",)),
+    "review": ("关联主播", ("跟播人员",)),
+}
 
 
 def personnel_payload() -> dict[str, Any]:
@@ -76,6 +88,13 @@ def view_matches(fs: Feishu) -> list[dict[str, str]]:
     return matches
 
 
+def linked_dependents(fs: Feishu) -> dict[str, list[dict[str, Any]]]:
+    return {
+        table_key: fs.search_records(TABLES[table_key], link_field, ANCHOR_ID, page_size=100)
+        for table_key, (link_field, _owner_fields) in DEPENDENT_SPECS.items()
+    }
+
+
 def run(fs: Feishu, out_dir: Path, apply: bool) -> dict[str, Any]:
     by_id, by_name = matching_personnel(fs)
     interview = read_record(fs, TABLES["interview"], INTERVIEW_ID)
@@ -87,6 +106,7 @@ def run(fs: Feishu, out_dir: Path, apply: bool) -> dict[str, Any]:
         "personnel_name_conflicts": by_name,
         "interview": interview,
         "anchor": anchor,
+        "dependents": linked_dependents(fs),
         "views": view_matches(fs),
     }
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -126,6 +146,18 @@ def run(fs: Feishu, out_dir: Path, apply: bool) -> dict[str, Any]:
 
     anchor = read_record(fs, TABLES["anchor"], ANCHOR_ID)
     ownership = sync_one_anchor_operator_to_interviews(fs, anchor)
+    dependent_sync = sync_reassigned_anchor_dependents(
+        fs,
+        [
+            {
+                "anchor_id": ANCHOR_ID,
+                "old_ids": [OLD_OPERATOR_ID],
+                "old_names": [OLD_OPERATOR_NAME],
+                "new_ids": [OPEN_ID],
+                "new_name": NAME,
+            }
+        ],
+    )
     views = sync_missing_personal_entries(fs, out_dir)
     workbench = sync_missing_workbench_rows(
         fs,
@@ -135,6 +167,7 @@ def run(fs: Feishu, out_dir: Path, apply: bool) -> dict[str, Any]:
 
     final_interview = read_record(fs, TABLES["interview"], INTERVIEW_ID)
     final_anchor = read_record(fs, TABLES["anchor"], ANCHOR_ID)
+    final_dependents = linked_dependents(fs)
     final_by_id, final_by_name = matching_personnel(fs)
     interview_fields = final_interview.get("fields") or {}
     anchor_fields = final_anchor.get("fields") or {}
@@ -151,6 +184,17 @@ def run(fs: Feishu, out_dir: Path, apply: bool) -> dict[str, Any]:
         failures.append("One or more personal views failed to provision.")
     if workbench.get("failed") or workbench.get("missing_views") or workbench.get("conflicts"):
         failures.append("One or more workbench entries failed to provision.")
+    for table_key, records in final_dependents.items():
+        for record in records:
+            fields = record.get("fields") or {}
+            if dependent_assignment_is_closed(table_key, fields):
+                continue
+            for owner_field in DEPENDENT_SPECS[table_key][1]:
+                if owner_field in {"责任人", "负责人"}:
+                    if text_value(fields.get(owner_field)).strip() != NAME:
+                        failures.append(f"{table_key}:{record.get('record_id')} still has a stale text owner.")
+                elif user_ids(fields.get(owner_field)) != [OPEN_ID]:
+                    failures.append(f"{table_key}:{record.get('record_id')} still has a stale user owner.")
 
     report = {
         "mode": "apply",
@@ -159,6 +203,7 @@ def run(fs: Feishu, out_dir: Path, apply: bool) -> dict[str, Any]:
         "personnel_record_id": personnel_record_id,
         "personnel_results": personnel_results,
         "ownership": ownership,
+        "dependent_sync": dependent_sync,
         "view_sync": {
             "created": views["view_sync"].get("created"),
             "existing": views["view_sync"].get("existing"),
@@ -173,6 +218,7 @@ def run(fs: Feishu, out_dir: Path, apply: bool) -> dict[str, Any]:
             "interview_user_ids": user_ids(interview_fields.get("对接运营账号（系统）")),
             "anchor_user_ids": user_ids(anchor_fields.get("运营经济人")),
             "personnel_count": len(final_by_id),
+            "dependent_counts": {key: len(value) for key, value in final_dependents.items()},
             "views": view_matches(fs),
         },
         "snapshot": str(out_dir / f"luoan-chain-before-{timestamp}.json"),
