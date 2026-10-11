@@ -2378,6 +2378,10 @@ def personnel_fields_changed(current: dict[str, Any], desired: dict[str, Any]) -
     return False
 
 
+def personnel_is_admin_locked(fields: dict[str, Any]) -> bool:
+    return bool(fields.get("手工锁定角色")) and text_value(fields.get("数据来源")).strip() == "管理员手工维护"
+
+
 def sync_personnel_directory(fs: Feishu, out_dir: Path) -> dict[str, Any]:
     full_sync = os.environ.get("CONTACT_FULL_SYNC_ENABLED", "false").lower() == "true"
     users = list_contact_users(fs)
@@ -2448,6 +2452,8 @@ def sync_personnel_directory(fs: Feishu, out_dir: Path) -> dict[str, Any]:
         existing_record = existing_by_user.get(open_id)
         if existing_record:
             existing_fields = existing_record.get("fields") or {}
+            if personnel_is_admin_locked(existing_fields):
+                continue
             changed: dict[str, Any] = {
                 "姓名": item.get("name") or text_value(existing_fields.get("姓名")) or open_id,
                 "在职状态": "停用",
@@ -2489,6 +2495,8 @@ def sync_personnel_directory(fs: Feishu, out_dir: Path) -> dict[str, Any]:
             if user_id in seen:
                 continue
             fields = record.get("fields") or {}
+            if personnel_is_admin_locked(fields):
+                continue
             from_directory = text_value(fields.get("数据来源")) == "通讯录自动同步"
             changed = {
                 "在职状态": "离职" if from_directory else "停用",

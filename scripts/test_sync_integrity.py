@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 import sync_missing_personal_entries as personal
 import sync_missing_workbench_rows as workbench
-from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, desired_anchor_number, find_existing_anchor_for_interview, keep_existing_fields, load_env, personnel_fields_changed, request_json, sync_linked_anchor_operators, sync_management_summary, sync_one_anchor_followup_to_interviews, sync_one_anchor_operator_to_interviews, sync_one_interview_followup_to_anchors, sync_one_interview_operator_to_anchors, sync_one_interview_personnel_assignment, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
+from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, desired_anchor_number, find_existing_anchor_for_interview, keep_existing_fields, load_env, personnel_fields_changed, personnel_is_admin_locked, request_json, sync_linked_anchor_operators, sync_management_summary, sync_one_anchor_followup_to_interviews, sync_one_anchor_operator_to_interviews, sync_one_interview_followup_to_anchors, sync_one_interview_operator_to_anchors, sync_one_interview_personnel_assignment, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
 from repair_live_data_integrity import CHILD_SPECS, plan_duplicate_child_cleanup
 
 
@@ -1056,6 +1056,18 @@ class SyncIntegrityTests(unittest.TestCase):
     def test_missing_and_empty_personnel_text_are_equivalent(self) -> None:
         self.assertFalse(personnel_fields_changed({}, {"岗位": ""}))
         self.assertTrue(personnel_fields_changed({}, {"岗位": "运营"}))
+
+    def test_admin_locked_personnel_is_preserved_when_contact_is_not_visible(self) -> None:
+        self.assertTrue(
+            personnel_is_admin_locked(
+                {"手工锁定角色": True, "数据来源": "管理员手工维护"}
+            )
+        )
+        self.assertFalse(
+            personnel_is_admin_locked(
+                {"手工锁定角色": True, "数据来源": "业务记录发现"}
+            )
+        )
 
     def test_contact_internal_error_is_retried(self) -> None:
         class ContactFeishu:
