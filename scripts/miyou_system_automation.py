@@ -1929,6 +1929,83 @@ def build_chain(
     assignment_sync = ownership_sync["assignment_sync"]
     anchor_operator_sync = ownership_sync["anchor_operator_sync"]
     recovered_child_repair = ensure_recovered_anchor_children(fs, list(recovered_pairs_by_anchor_id.values()), batch)
+
+    # The ownership pass can take several minutes on a large Base. Refresh both
+    # sides immediately before creation so a second writer cannot turn the
+    # initial snapshot into duplicate streamer profiles.
+    fresh_current_transfer = fs.search_records(TABLES["interview"], TRANSFER_TO_ANCHOR_FIELD, page_size=100)
+    fresh_legacy_transfer = fs.search_records(TABLES["interview"], LEGACY_TRANSFER_TO_ANCHOR_FIELD, page_size=100)
+    fresh_interviews_by_id = {
+        record["record_id"]: record
+        for record in [*fresh_current_transfer, *fresh_legacy_transfer]
+        if record.get("record_id")
+    }
+    fresh_anchors = fs.list_records(TABLES["anchor"], page_size=500)
+    fresh_anchors_by_id = {
+        str(anchor.get("record_id") or ""): anchor
+        for anchor in fresh_anchors
+        if anchor.get("record_id")
+    }
+    precreate_interview_updates: list[dict[str, Any]] = []
+    precreate_anchor_updates_by_id: dict[str, dict[str, Any]] = {}
+    precreate_pairs_by_anchor_id: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    precreate_reused_anchors = 0
+    create_candidates: list[dict[str, Any]] = []
+    for stale_record in selected:
+        record = fresh_interviews_by_id.get(stale_record["record_id"], stale_record)
+        fields = record.get("fields") or {}
+        existing_anchor = find_existing_anchor_for_interview(fs, record, fresh_anchors_by_id)
+        if not existing_anchor:
+            # A targeted last-moment search closes the remaining gap between
+            # the full-table refresh and the create call.
+            search_fields = dict(fields)
+            search_fields["关联主播档案"] = []
+            existing_anchor = find_existing_anchor_for_interview(
+                fs,
+                {"record_id": record["record_id"], "fields": search_fields},
+            )
+        if existing_anchor:
+            existing_anchor_id = str(existing_anchor["record_id"])
+            existing_anchor_fields = existing_anchor.get("fields") or {}
+            source_ids = linked_record_ids(existing_anchor_fields.get("来源面试记录"))
+            precreate_interview_updates.append(
+                {
+                    "record_id": record["record_id"],
+                    "fields": {
+                        "系统：已生成主播档案": True,
+                        "关联主播档案": [existing_anchor_id],
+                        "系统处理状态": "已恢复主播档案关联",
+                        "系统处理备注": "创建前复核发现已有主播档案，系统已复用原档案并阻止重复生成。",
+                    },
+                }
+            )
+            if record["record_id"] not in source_ids:
+                precreate_anchor_updates_by_id[existing_anchor_id] = {
+                    "record_id": existing_anchor_id,
+                    "fields": {"来源面试记录": [*source_ids, record["record_id"]]},
+                }
+            precreate_pairs_by_anchor_id[existing_anchor_id] = (existing_anchor, record)
+            precreate_reused_anchors += 1
+            continue
+        if eligible_interview(record, not_before_ms):
+            create_candidates.append(record)
+    selected = create_candidates
+    precreate_interview_results = (
+        fs.batch_update(TABLES["interview"], precreate_interview_updates, batch_size=500)
+        if precreate_interview_updates
+        else []
+    )
+    precreate_anchor_updates = list(precreate_anchor_updates_by_id.values())
+    precreate_anchor_results = (
+        fs.batch_update(TABLES["anchor"], precreate_anchor_updates, batch_size=500)
+        if precreate_anchor_updates
+        else []
+    )
+    precreate_child_repair = ensure_recovered_anchor_children(
+        fs,
+        list(precreate_pairs_by_anchor_id.values()),
+        batch,
+    )
     anchor_records = []
     base_times: list[datetime] = []
     for index, record in enumerate(selected, start=1):
@@ -1994,6 +2071,10 @@ def build_chain(
             "recovered_interview_update_results": recovered_results,
             "recovered_anchor_update_results": recovered_anchor_results,
             "recovered_child_repair": recovered_child_repair,
+            "precreate_reused_anchors": precreate_reused_anchors,
+            "precreate_interview_update_results": precreate_interview_results,
+            "precreate_anchor_update_results": precreate_anchor_results,
+            "precreate_child_repair": precreate_child_repair,
             "selected_interviews": len(selected),
             "created_anchors": len(anchors),
             "removed_anchor_fields": removed_anchor_fields,
@@ -2072,6 +2153,10 @@ def build_chain(
         "recovered_interview_update_results": recovered_results,
         "recovered_anchor_update_results": recovered_anchor_results,
         "recovered_child_repair": recovered_child_repair,
+        "precreate_reused_anchors": precreate_reused_anchors,
+        "precreate_interview_update_results": precreate_interview_results,
+        "precreate_anchor_update_results": precreate_anchor_results,
+        "precreate_child_repair": precreate_child_repair,
         "selected_interviews": len(selected),
         "created_anchors": len(anchors),
         "removed_anchor_fields": removed_anchor_fields,

@@ -42,6 +42,47 @@ API_QUOTA_STATE: dict[str, object] = {"exhausted": False}
 PERSONNEL_WAKE_EVENT = threading.Event()
 
 
+def acquire_anchor_transfer_process_lock() -> object | None:
+    """Prevent overlapping writers when two service processes share one host."""
+    path = Path(os.environ.get("ANCHOR_TRANSFER_LOCK_FILE", "runtime/anchor-transfer.lock"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+    except (BlockingIOError, OSError):
+        handle.close()
+        return None
+
+
+def release_anchor_transfer_process_lock(handle: object | None) -> None:
+    if handle is None:
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
 def is_api_quota_exhausted_error(exc: BaseException) -> bool:
     message = str(exc)
     return "99991403" in message or "API call quota has been exceeded" in message
@@ -310,6 +351,11 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
     if not FEISHU_SCAN_LOCK.acquire(blocking=False):
         ANCHOR_TRANSFER_LOCK.release()
         return {"skipped": True, "reason": "Another Feishu full scan is already running."}
+    process_lock = acquire_anchor_transfer_process_lock()
+    if process_lock is None:
+        FEISHU_SCAN_LOCK.release()
+        ANCHOR_TRANSFER_LOCK.release()
+        return {"skipped": True, "reason": "Another automation process is already creating streamer profiles."}
     started_at = datetime.now().astimezone()
     with ANCHOR_TRANSFER_STATE_LOCK:
         LAST_ANCHOR_TRANSFER.clear()
@@ -370,7 +416,7 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
                     "checked_records": build.get("checked_interviews", 0),
                     "selected_records": build.get("selected_interviews", 0),
                     "created_anchors": build.get("created_anchors", 0),
-                    "recovered_links": build.get("recovered_existing_anchors", 0),
+                    "recovered_links": build.get("recovered_existing_anchors", 0) + build.get("precreate_reused_anchors", 0),
                     "updated_recruiter_assignments": ((build.get("anchor_operator_sync") or {}).get("updated_fields") or {}).get("招募经济人", 0),
                     "updated_interviewer_assignments": ((build.get("anchor_operator_sync") or {}).get("updated_fields") or {}).get("面试官", 0),
                     "updated_operator_assignments": ((build.get("anchor_operator_sync") or {}).get("updated_fields") or {}).get("运营经济人", 0),
@@ -396,6 +442,7 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
             )
         raise
     finally:
+        release_anchor_transfer_process_lock(process_lock)
         FEISHU_SCAN_LOCK.release()
         ANCHOR_TRANSFER_LOCK.release()
 

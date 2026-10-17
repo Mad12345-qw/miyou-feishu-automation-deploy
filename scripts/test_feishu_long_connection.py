@@ -4,6 +4,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -40,6 +41,20 @@ class FeishuLongConnectionTests(unittest.TestCase):
         self.assertEqual(21600, intervals["personnel"])
         self.assertEqual(21600, intervals["integrity"])
         self.assertEqual(86400, intervals["reporting"])
+
+    def test_anchor_transfer_process_lock_blocks_a_second_writer(self) -> None:
+        with TemporaryDirectory() as tmp:
+            lock_path = str(Path(tmp) / "anchor-transfer.lock")
+            with patch.dict(os.environ, {"ANCHOR_TRANSFER_LOCK_FILE": lock_path}):
+                first = service.acquire_anchor_transfer_process_lock()
+                self.assertIsNotNone(first)
+                second = service.acquire_anchor_transfer_process_lock()
+                self.assertIsNone(second)
+                service.release_anchor_transfer_process_lock(first)
+                third = service.acquire_anchor_transfer_process_lock()
+                self.assertIsNotNone(third)
+                service.release_anchor_transfer_process_lock(third)
+
     def test_subscription_is_created_and_verified(self) -> None:
         class FakeFeishu:
             def __init__(self, token: str) -> None:

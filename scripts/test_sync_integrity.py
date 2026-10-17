@@ -11,6 +11,7 @@ import sync_missing_personal_entries as personal
 import sync_missing_workbench_rows as workbench
 from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, desired_anchor_number, find_existing_anchor_for_interview, keep_existing_fields, load_env, personnel_fields_changed, personnel_is_admin_locked, request_json, sync_linked_anchor_operators, sync_management_summary, sync_one_anchor_followup_to_interviews, sync_one_anchor_operator_to_interviews, sync_one_interview_followup_to_anchors, sync_one_interview_operator_to_anchors, sync_one_interview_personnel_assignment, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
 from repair_live_data_integrity import CHILD_SPECS, plan_duplicate_child_cleanup
+from repair_duplicate_anchor_profiles import build_plan as build_duplicate_anchor_plan
 
 
 USER_ID = "ou_correct_user"
@@ -104,6 +105,80 @@ class FakeFeishu:
 
 
 class SyncIntegrityTests(unittest.TestCase):
+    def test_duplicate_anchor_plan_preserves_progress_and_relinks_children(self) -> None:
+        records = {
+            "interview": [
+                {
+                    "record_id": "rec_interview",
+                    "fields": {
+                        "候选人姓名": "主播甲",
+                        "关联主播档案": ["rec_new"],
+                        "对接运营账号（系统）": [{"id": "ou_current"}],
+                    },
+                }
+            ],
+            "anchor": [
+                {
+                    "record_id": "rec_old",
+                    "fields": {
+                        "主播编号": "MYZB-AUTO-interview",
+                        "主播名字": "主播甲",
+                        "来源面试记录": ["rec_interview"],
+                        "主播状态": "正常直播",
+                        "运营经济人": [{"id": "ou_manual"}],
+                        "面试官跟进记录": "旧档案跟进",
+                        "自动化批次": "LIVE-20261014",
+                    },
+                },
+                {
+                    "record_id": "rec_new",
+                    "fields": {
+                        "主播编号": "MYZB-AUTO-interview",
+                        "主播名字": "主播甲",
+                        "来源面试记录": ["rec_interview"],
+                        "主播状态": "待开播",
+                        "面试官跟进记录": "新档案补充",
+                        "自动化批次": "LIVE-20261016",
+                    },
+                },
+            ],
+            "node": [],
+            "task": [
+                {
+                    "record_id": "task_old",
+                    "fields": {
+                        "对应主播": ["rec_old"],
+                        "任务名称": "建联",
+                        "完成情况": "已完成",
+                    },
+                },
+                {
+                    "record_id": "task_new",
+                    "fields": {
+                        "对应主播": ["rec_new"],
+                        "任务名称": "建联",
+                        "工作状态": "未开始",
+                    },
+                },
+            ],
+            "visual": [],
+            "training": [],
+            "first_live": [],
+        }
+
+        plan = build_duplicate_anchor_plan(records)
+
+        self.assertEqual("rec_old", plan["groups"][0]["canonical_anchor_id"])
+        self.assertEqual(["rec_new"], plan["deletes"]["anchor"])
+        self.assertEqual(["task_new"], plan["deletes"]["task"])
+        self.assertEqual(
+            [{"id": "ou_manual"}, {"id": "ou_current"}],
+            plan["updates"]["anchor"]["rec_old"]["运营经济人"],
+        )
+        self.assertIn("旧档案跟进", plan["updates"]["anchor"]["rec_old"]["面试官跟进记录"])
+        self.assertIn("新档案补充", plan["updates"]["anchor"]["rec_old"]["面试官跟进记录"])
+        self.assertEqual(["rec_old"], plan["updates"]["interview"]["rec_interview"]["关联主播档案"])
+
     def test_deleted_optional_anchor_field_does_not_reject_the_whole_record(self) -> None:
         records, removed = keep_existing_fields(
             [{"fields": {"主播编号": "MYZB-1", "主播名字": "主播甲", "核心顾虑点": "已删除字段"}}],
