@@ -303,6 +303,7 @@ class SyncIntegrityTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             report = sync_one_interview_personnel_assignment(fs, "rec-interview", Path(directory))
 
+        self.assertTrue(report["deferred"])
         self.assertEqual([], report["updated_fields"])
         self.assertEqual([], fs.updated)
 
@@ -321,6 +322,7 @@ class SyncIntegrityTests(unittest.TestCase):
                                 "对接运营": "",
                                 "对接运营账号（系统）": [{"id": USER_ID, "name": "测试运营"}],
                                 "关联主播档案": [],
+                                "通过转入主播": True,
                             },
                         }
                     },
@@ -492,6 +494,7 @@ class SyncIntegrityTests(unittest.TestCase):
                                 "fields": {
                                     "招募人": "测试员工",
                                     "招募人账号（系统）": [],
+                                    "系统：最后修改时间": 1,
                                 },
                             }
                         ]
@@ -518,13 +521,50 @@ class SyncIntegrityTests(unittest.TestCase):
 
         fs = RecentFake()
 
-        result = sync_recent_interview_assignments(fs, limit=100)
+        result = sync_recent_interview_assignments(fs, limit=100, quiet_seconds=600, now_ms=1_000_000)
 
         self.assertEqual(1, result["scanned_records"])
+        self.assertEqual(1, result["eligible_records"])
+        self.assertEqual(0, result["deferred_records"])
         self.assertEqual(1, result["updated_records"])
         self.assertEqual({"page_size": 100}, fs.calls[0][2])
         self.assertEqual("系统：最后修改时间", fs.calls[0][3]["sort"][0]["field_name"])
         self.assertEqual([{"record_id": "rec_recent", "fields": {"招募人账号（系统）": [{"id": USER_ID}]}}], fs.updated)
+
+    def test_recent_assignment_sync_defers_a_record_that_is_still_being_edited(self) -> None:
+        class RecentFake:
+            def __init__(self) -> None:
+                self.updated = []
+
+            def api(self, method, path, query=None, body=None):
+                return {
+                    "code": 0,
+                    "data": {
+                        "items": [{
+                            "record_id": "rec_active",
+                            "fields": {
+                                "候选人姓名": "刚输入的姓名",
+                                "系统：最后修改时间": 999_500,
+                            },
+                        }]
+                    },
+                }
+
+            def list_records(self, table_id, page_size=500):
+                raise AssertionError("An active interview must not start personnel resolution.")
+
+            def batch_update(self, table_id, records, batch_size=500):
+                self.updated.extend(records)
+                return [{"code": 0}]
+
+        fs = RecentFake()
+        result = sync_recent_interview_assignments(fs, limit=100, quiet_seconds=600, now_ms=1_000_000)
+
+        self.assertEqual(1, result["scanned_records"])
+        self.assertEqual(0, result["eligible_records"])
+        self.assertEqual(1, result["deferred_records"])
+        self.assertEqual(0, result["updated_records"])
+        self.assertEqual([], fs.updated)
 
     def test_batch_delete_uses_feishu_batch_endpoint(self) -> None:
         fs = Feishu("token")

@@ -445,6 +445,15 @@ def interview_is_completed(fields: dict[str, Any]) -> bool:
     ).strip() in {"已完成", "已面试"}
 
 
+def interview_allows_immediate_automation(fields: dict[str, Any]) -> bool:
+    """Only write immediately after an explicit transfer or an existing anchor link."""
+    return bool(
+        fields.get(TRANSFER_TO_ANCHOR_FIELD) is True
+        or fields.get(LEGACY_TRANSFER_TO_ANCHOR_FIELD) is True
+        or linked_record_ids(fields.get("关联主播档案"))
+    )
+
+
 def blocked_preinterview_operator_names() -> set[str]:
     raw = os.environ.get("BLOCK_PREINTERVIEW_OPERATOR_NAMES", "耿艳丽")
     return {
@@ -1008,6 +1017,13 @@ def find_existing_anchor_for_interview(
 
 def sync_selected_interview_assignments(fs: Feishu, records: list[dict[str, Any]]) -> dict[str, Any]:
     """Resolve visible personnel names to Feishu users for the supplied interviews."""
+    if not records:
+        return {
+            "updated_records": 0,
+            "cleared_premature_operators": 0,
+            "unresolved_values": [],
+            "results": [],
+        }
     people_candidates: dict[str, list[list[dict[str, str]]]] = defaultdict(list)
     for person in fs.list_records(TABLES["personnel"], page_size=500):
         fields = person.get("fields") or {}
@@ -1076,8 +1092,13 @@ def sync_selected_interview_assignments(fs: Feishu, records: list[dict[str, Any]
     }
 
 
-def sync_recent_interview_assignments(fs: Feishu, limit: int = 500) -> dict[str, Any]:
-    """Repair recently edited interview owners without a full-table scan."""
+def sync_recent_interview_assignments(
+    fs: Feishu,
+    limit: int = 500,
+    quiet_seconds: int = 900,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    """Repair owners only after a record has been idle long enough to avoid active editors."""
     page_size = max(1, min(500, limit))
     response = fs.api(
         "POST",
@@ -1088,8 +1109,24 @@ def sync_recent_interview_assignments(fs: Feishu, limit: int = 500) -> dict[str,
     if response.get("code") != 0:
         raise RuntimeError(f"Unable to read recently changed interviews: {response}")
     records = ((response.get("data") or {}).get("items") or [])[:page_size]
-    result = sync_selected_interview_assignments(fs, records)
-    return {"scanned_records": len(records), **result}
+    current_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    cutoff_ms = current_ms - max(0, quiet_seconds) * 1000
+    eligible_records: list[dict[str, Any]] = []
+    deferred_records = 0
+    for record in records:
+        modified_at = (record.get("fields") or {}).get(SYSTEM_MODIFIED_AT_FIELD)
+        if not isinstance(modified_at, (int, float)) or modified_at > cutoff_ms:
+            deferred_records += 1
+            continue
+        eligible_records.append(record)
+    result = sync_selected_interview_assignments(fs, eligible_records)
+    return {
+        "scanned_records": len(records),
+        "eligible_records": len(eligible_records),
+        "deferred_records": deferred_records,
+        "quiet_seconds": max(0, quiet_seconds),
+        **result,
+    }
 
 
 def read_record(fs: Feishu, table_id: str, record_id: str) -> dict[str, Any]:
@@ -3033,21 +3070,35 @@ def sync_one_interview_personnel_assignment(fs: Feishu, record_id: str, out_dir:
     if response.get("code") != 0 or not record.get("record_id"):
         raise RuntimeError(f"Unable to read interview record {record_id}: {response}")
 
+    fields = record.get("fields") or {}
+    if not interview_allows_immediate_automation(fields):
+        report = {
+            "record_id": record_id,
+            "deferred": True,
+            "reason": "Interview entry is still active; no Feishu fields were written.",
+            "updated_fields": [],
+            "unresolved_values": [],
+            "followup_sync": {"deferred": True, "updated_anchors": 0},
+            "results": [],
+        }
+        write_json(out_dir / f"sync_interview_assignment_{record_id}.json", report)
+        return report
+
     active_people: list[dict[str, Any]] = []
     for person_record in fs.list_records(TABLES["personnel"], page_size=500):
-        fields = person_record.get("fields") or {}
-        if text_value(fields.get("在职状态")) != "在职" or text_value(fields.get("账号状态")) != "正常":
+        person_fields = person_record.get("fields") or {}
+        if text_value(person_fields.get("在职状态")) != "在职" or text_value(person_fields.get("账号状态")) != "正常":
             continue
-        name = text_value(fields.get("姓名")).strip()
-        users = [{"id": user_id} for user_id in user_ids(fields.get("飞书用户"))]
+        name = text_value(person_fields.get("姓名")).strip()
+        users = [{"id": user_id} for user_id in user_ids(person_fields.get("飞书用户"))]
         if name and users:
             active_people.append(
                 {
                     "name": name,
-                    "aliases": normalized_owner_names(fields.get("姓名"), fields.get("匹配别名")),
-                    "department": text_value(fields.get("组织部门")).strip(),
+                    "aliases": normalized_owner_names(person_fields.get("姓名"), person_fields.get("匹配别名")),
+                    "department": text_value(person_fields.get("组织部门")).strip(),
                     "users": users,
-                    "roles": set(list_value(fields.get("角色"))),
+                    "roles": set(list_value(person_fields.get("角色"))),
                 }
             )
     name_counts: dict[str, int] = {}
@@ -3071,7 +3122,6 @@ def sync_one_interview_personnel_assignment(fs: Feishu, record_id: str, out_dir:
             if "招募经纪人" in person["roles"]:
                 recruiters_by_user_id[user_id] = display_name
 
-    fields = record.get("fields") or {}
     changed: dict[str, Any] = {}
     unresolved: list[str] = []
     for visible_name, spec in INTERVIEW_PERSONNEL_DROPDOWNS.items():

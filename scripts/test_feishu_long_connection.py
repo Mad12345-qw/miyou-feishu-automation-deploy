@@ -122,9 +122,39 @@ class FeishuLongConnectionTests(unittest.TestCase):
             )
 
         personnel_sync.assert_called_once()
-        read.assert_called_once_with(fs, service.TABLES["interview"], "rec-interview")
+        self.assertEqual(2, read.call_count)
         operator_sync.assert_called_once_with(fs, interview)
         self.assertEqual(["对接运营账号（系统）", "03运营经济人"], result["updated"])
+
+    def test_interview_event_never_writes_while_the_row_is_still_being_entered(self) -> None:
+        fs = object()
+        interview = {
+            "record_id": "rec-active",
+            "fields": {
+                "候选人姓名": "刚输入的姓名",
+                "邀约时间": 1,
+                "对接运营": ["耿艳丽"],
+            },
+        }
+        with (
+            patch.object(service, "read_record", return_value=interview) as read,
+            patch.object(service, "sync_one_interview_personnel_assignment") as personnel_sync,
+            patch.object(service, "sync_one_interview_operator_to_anchors") as operator_sync,
+            patch.object(service, "trigger_anchor_transfer_async") as trigger,
+        ):
+            result = service.process_feishu_record_change(
+                fs,
+                service.TABLES["interview"],
+                "rec-active",
+                "long_connection",
+            )
+
+        read.assert_called_once_with(fs, service.TABLES["interview"], "rec-active")
+        personnel_sync.assert_not_called()
+        operator_sync.assert_not_called()
+        trigger.assert_not_called()
+        self.assertTrue(result["result"]["deferred"])
+        self.assertEqual([], result["updated"])
 
     def test_anchor_event_updates_linked_interview_followup(self) -> None:
         fs = object()

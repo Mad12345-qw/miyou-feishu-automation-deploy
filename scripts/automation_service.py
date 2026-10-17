@@ -11,7 +11,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 
 from mobile_interview_form import register_mobile_interview_form
-from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, read_record, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_anchor_numbers, sync_one_anchor_followup_to_interviews, sync_one_anchor_number, sync_one_anchor_operator_to_interviews, sync_one_interview_operator_to_anchors, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory, sync_recent_interview_assignments
+from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, interview_allows_immediate_automation, read_record, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_anchor_numbers, sync_one_anchor_followup_to_interviews, sync_one_anchor_number, sync_one_anchor_operator_to_interviews, sync_one_interview_operator_to_anchors, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory, sync_recent_interview_assignments
 from run_miyou_rule_engine import reconcile
 from sync_missing_personal_entries import sync_missing_personal_entries
 from sync_missing_workbench_rows import sync_missing_workbench_rows
@@ -373,6 +373,7 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
         recent_assignments = sync_recent_interview_assignments(
             fs,
             limit=max(1, int(os.environ.get("RECENT_INTERVIEW_ASSIGNMENT_LIMIT", "500"))),
+            quiet_seconds=max(0, int(os.environ.get("RECENT_INTERVIEW_QUIET_SECONDS", "900"))),
         )
         anchor_numbers = sync_missing_anchor_numbers(fs, out_dir)
         build = build_chain(
@@ -421,6 +422,8 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
                     "updated_interviewer_assignments": ((build.get("anchor_operator_sync") or {}).get("updated_fields") or {}).get("面试官", 0),
                     "updated_operator_assignments": ((build.get("anchor_operator_sync") or {}).get("updated_fields") or {}).get("运营经济人", 0),
                     "recent_assignment_records": recent_assignments.get("scanned_records", 0),
+                    "recent_assignment_eligible": recent_assignments.get("eligible_records", 0),
+                    "recent_assignment_deferred": recent_assignments.get("deferred_records", 0),
                     "recent_assignment_updates": recent_assignments.get("updated_records", 0),
                     "recent_assignment_unresolved": len(recent_assignments.get("unresolved_values") or []),
                     "missing_linked_anchors": len((build.get("anchor_operator_sync") or {}).get("missing_linked_anchor_ids") or []),
@@ -665,6 +668,16 @@ def process_feishu_record_change(
 ) -> dict[str, object]:
     """Run the narrow maintenance required for one changed Base record."""
     if table_id == TABLES["interview"]:
+        interview = read_record(fs, TABLES["interview"], record_id)
+        if not interview_allows_immediate_automation(interview.get("fields") or {}):
+            return {
+                "result": {
+                    "record_id": record_id,
+                    "deferred": True,
+                    "reason": "Interview entry is still active; no Feishu fields were written.",
+                },
+                "updated": [],
+            }
         result = sync_one_interview_personnel_assignment(fs, record_id, Path("runtime"))
         interview = read_record(fs, TABLES["interview"], record_id)
         operator_result = sync_one_interview_operator_to_anchors(fs, interview)
