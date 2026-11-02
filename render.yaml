@@ -53,6 +53,8 @@ services:
         value: "false"
       - key: ANCHOR_MAINTENANCE_SYNC_ENABLED
         value: "false"
+      - key: ANCHOR_TRANSFER_DAILY_TIMES
+        value: "15:00,18:00"
       - key: LEGACY_ASSIGNMENT_BACKFILL_ENABLED
         value: "false"
       - key: AUTOMATION_CUTOVER_MS

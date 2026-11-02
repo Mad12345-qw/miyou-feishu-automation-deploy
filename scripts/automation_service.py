@@ -5,13 +5,13 @@ import queue
 import threading
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, request
 
 from mobile_interview_form import register_mobile_interview_form
-from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, interview_allows_immediate_automation, read_record, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_anchor_numbers, sync_one_anchor_followup_to_interviews, sync_one_anchor_number, sync_one_anchor_operator_to_interviews, sync_one_interview_operator_to_anchors, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory, sync_recent_interview_assignments
+from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, interview_allows_immediate_automation, read_record, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_anchor_numbers, sync_one_anchor_followup_to_interviews, sync_one_anchor_number, sync_one_anchor_operator_to_interviews, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory, sync_recent_interview_assignments
 from run_miyou_rule_engine import reconcile
 from sync_missing_personal_entries import sync_missing_personal_entries
 from sync_missing_workbench_rows import sync_missing_workbench_rows
@@ -40,6 +40,7 @@ LAST_ANCHOR_TRANSFER: dict[str, object] = {"status": "not_run"}
 FEISHU_LONG_CONNECTION_STATE: dict[str, object] = {"status": "disabled"}
 API_QUOTA_STATE: dict[str, object] = {"exhausted": False}
 PERSONNEL_WAKE_EVENT = threading.Event()
+BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
 def acquire_anchor_transfer_process_lock() -> object | None:
@@ -134,12 +135,48 @@ def api_quota_wait_seconds() -> int:
 
 def scheduler_intervals() -> dict[str, int]:
     return {
-        "anchor": max(300, int(os.environ.get("ANCHOR_TRANSFER_INTERVAL_SECONDS", "300"))),
         "personnel_probe": max(900, int(os.environ.get("PERSONNEL_PROBE_INTERVAL_SECONDS", "3600"))),
         "personnel": max(3600, int(os.environ.get("PERSONNEL_ENTRY_INTERVAL_SECONDS", "21600"))),
         "integrity": max(3600, int(os.environ.get("INTERVIEW_INTEGRITY_INTERVAL_SECONDS", "21600"))),
         "reporting": max(21600, int(os.environ.get("REPORTING_INTERVAL_SECONDS", "86400"))),
     }
+
+
+def anchor_transfer_daily_times() -> tuple[tuple[int, int], ...]:
+    raw_value = os.environ.get("ANCHOR_TRANSFER_DAILY_TIMES", "15:00,18:00")
+    parsed: set[tuple[int, int]] = set()
+    for raw_item in raw_value.split(","):
+        item = raw_item.strip()
+        try:
+            hour_text, minute_text = item.split(":", 1)
+            hour = int(hour_text)
+            minute = int(minute_text)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid ANCHOR_TRANSFER_DAILY_TIMES item: {item!r}") from exc
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            raise ValueError(f"Invalid ANCHOR_TRANSFER_DAILY_TIMES item: {item!r}")
+        parsed.add((hour, minute))
+    if not parsed:
+        raise ValueError("ANCHOR_TRANSFER_DAILY_TIMES must contain at least one HH:MM value.")
+    return tuple(sorted(parsed))
+
+
+def next_anchor_transfer_at(now: datetime | None = None) -> datetime:
+    current = now or datetime.now(BEIJING_TZ)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=BEIJING_TZ)
+    current = current.astimezone(BEIJING_TZ)
+    for hour, minute in anchor_transfer_daily_times():
+        candidate = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate > current:
+            return candidate
+    first_hour, first_minute = anchor_transfer_daily_times()[0]
+    return (current + timedelta(days=1)).replace(
+        hour=first_hour,
+        minute=first_minute,
+        second=0,
+        microsecond=0,
+    )
 
 
 def tenant_token() -> str:
@@ -450,21 +487,6 @@ def run_anchor_transfer_cycle() -> dict[str, object]:
         ANCHOR_TRANSFER_LOCK.release()
 
 
-def trigger_anchor_transfer_async(reason: str) -> bool:
-    """Wake a self-healing cycle without delaying health checks or Feishu callbacks."""
-    if not service_enabled() or not api_quota_available() or ANCHOR_TRANSFER_LOCK.locked():
-        return False
-
-    def run() -> None:
-        try:
-            run_anchor_transfer_cycle()
-        except Exception as exc:
-            app.logger.exception("Async anchor transfer sync failed (%s): %s", reason, exc)
-
-    threading.Thread(target=run, daemon=True, name=f"Anchor transfer: {reason}").start()
-    return True
-
-
 def run_reporting_cycle() -> dict[str, object]:
     """Run lower-priority reports and calendars separately from operational writes."""
     if not service_enabled():
@@ -547,9 +569,27 @@ def background_scheduler() -> None:
             else:
                 time.sleep(wait_seconds)
 
+    def anchor_transfer_worker() -> None:
+        while True:
+            scheduled_at = next_anchor_transfer_at()
+            wait_seconds = max(0.0, (scheduled_at - datetime.now(BEIJING_TZ)).total_seconds())
+            time.sleep(wait_seconds)
+            if not service_enabled():
+                app.logger.info("Skipped scheduled anchor transfer at %s because automation is disabled.", scheduled_at)
+                continue
+            if not api_quota_available():
+                app.logger.error("Skipped scheduled anchor transfer at %s because the Feishu API quota is exhausted.", scheduled_at)
+                continue
+            try:
+                run_anchor_transfer_cycle()
+            except Exception as exc:
+                if mark_api_quota_exhausted(exc):
+                    app.logger.error("Scheduled anchor transfer paused because the monthly Feishu API quota is exhausted.")
+                else:
+                    app.logger.exception("Scheduled anchor transfer failed: %s", exc)
+
     intervals = scheduler_intervals()
     workers = [
-        ("Anchor transfer sync", intervals["anchor"], 0, service_enabled, run_anchor_transfer_cycle),
         (
             "Personnel directory probe",
             intervals["personnel_probe"],
@@ -579,6 +619,11 @@ def background_scheduler() -> None:
             daemon=True,
             name=name,
         ).start()
+    threading.Thread(
+        target=anchor_transfer_worker,
+        daemon=True,
+        name="Scheduled anchor transfer sync",
+    ).start()
     while True:
         time.sleep(3600)
 
@@ -679,13 +724,12 @@ def process_feishu_record_change(
                 "updated": [],
             }
         result = sync_one_interview_personnel_assignment(fs, record_id, Path("runtime"))
-        interview = read_record(fs, TABLES["interview"], record_id)
-        operator_result = sync_one_interview_operator_to_anchors(fs, interview)
-        result["operator_sync"] = operator_result
+        result["anchor_transfer_schedule"] = {
+            "timezone": "Asia/Shanghai",
+            "daily_times": [f"{hour:02d}:{minute:02d}" for hour, minute in anchor_transfer_daily_times()],
+            "next_run_at": next_anchor_transfer_at().isoformat(timespec="minutes"),
+        }
         updated = list(result.get("updated_fields", []))
-        if operator_result.get("updated_anchors"):
-            updated.append("03运营经济人")
-        trigger_anchor_transfer_async(f"Feishu interview event via {transport}")
     else:
         number_result = sync_one_anchor_number(fs, record_id, Path("runtime"))
         anchor = read_record(fs, TABLES["anchor"], record_id)
@@ -833,9 +877,7 @@ def health() -> object:
     quota_available = api_quota_available()
     with API_QUOTA_STATE_LOCK:
         api_quota = dict(API_QUOTA_STATE)
-    anchor_transfer_wake_requested = False
-    if quota_available and last_anchor_transfer.get("status") in {"not_run", "failed"}:
-        anchor_transfer_wake_requested = trigger_anchor_transfer_async("health wake")
+    anchor_schedule = [f"{hour:02d}:{minute:02d}" for hour, minute in anchor_transfer_daily_times()]
     return jsonify(
         {
             "ok": True,
@@ -862,8 +904,11 @@ def health() -> object:
             "personnel_wake_pending": PERSONNEL_WAKE_EVENT.is_set(),
             "last_personnel_provisioning": last_provisioning,
             "last_anchor_transfer": last_anchor_transfer,
-            "anchor_transfer_wake_requested": anchor_transfer_wake_requested,
-            "schema_version": "2026-09-20-stable-interview-entry-v15",
+            "anchor_transfer_wake_requested": False,
+            "anchor_transfer_schedule_timezone": "Asia/Shanghai",
+            "anchor_transfer_daily_times": anchor_schedule,
+            "next_anchor_transfer_at": next_anchor_transfer_at().isoformat(timespec="minutes"),
+            "schema_version": "2026-11-02-twice-daily-anchor-transfer-v16",
             "active_batch": os.environ.get("AUTOMATION_ACTIVE_BATCH", ""),
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
         }

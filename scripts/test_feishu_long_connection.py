@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -36,11 +37,36 @@ class FeishuLongConnectionTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             intervals = service.scheduler_intervals()
 
-        self.assertEqual(300, intervals["anchor"])
+        self.assertNotIn("anchor", intervals)
         self.assertEqual(3600, intervals["personnel_probe"])
         self.assertEqual(21600, intervals["personnel"])
         self.assertEqual(21600, intervals["integrity"])
         self.assertEqual(86400, intervals["reporting"])
+
+    def test_anchor_transfer_runs_at_1500_and_1800_beijing_time(self) -> None:
+        beijing = timezone(timedelta(hours=8))
+        with patch.dict(os.environ, {}, clear=True):
+            before_first = datetime(2026, 11, 2, 14, 59, 59, tzinfo=beijing)
+            after_first = datetime(2026, 11, 2, 15, 0, 1, tzinfo=beijing)
+            after_second = datetime(2026, 11, 2, 18, 0, 1, tzinfo=beijing)
+
+            self.assertEqual(
+                datetime(2026, 11, 2, 15, 0, tzinfo=service.BEIJING_TZ),
+                service.next_anchor_transfer_at(before_first),
+            )
+            self.assertEqual(
+                datetime(2026, 11, 2, 18, 0, tzinfo=service.BEIJING_TZ),
+                service.next_anchor_transfer_at(after_first),
+            )
+            self.assertEqual(
+                datetime(2026, 11, 3, 15, 0, tzinfo=service.BEIJING_TZ),
+                service.next_anchor_transfer_at(after_second),
+            )
+
+    def test_anchor_transfer_schedule_rejects_invalid_values(self) -> None:
+        with patch.dict(os.environ, {"ANCHOR_TRANSFER_DAILY_TIMES": "15:00,25:00"}):
+            with self.assertRaises(ValueError):
+                service.anchor_transfer_daily_times()
 
     def test_anchor_transfer_process_lock_blocks_a_second_writer(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -97,7 +123,7 @@ class FeishuLongConnectionTests(unittest.TestCase):
         self.assertEqual(["rec-a", "rec-b"], enqueue.call_args.args[3])
         self.assertEqual("long_connection", enqueue.call_args.args[4])
 
-    def test_interview_event_updates_linked_anchor_operator(self) -> None:
+    def test_interview_event_defers_02_to_03_writes_to_the_daily_schedule(self) -> None:
         fs = object()
         interview = {"record_id": "rec-interview", "fields": {"关联主播档案": ["rec-anchor"]}}
         with (
@@ -107,12 +133,6 @@ class FeishuLongConnectionTests(unittest.TestCase):
                 return_value={"updated_fields": ["对接运营账号（系统）"]},
             ) as personnel_sync,
             patch.object(service, "read_record", return_value=interview) as read,
-            patch.object(
-                service,
-                "sync_one_interview_operator_to_anchors",
-                return_value={"updated_anchors": 1},
-            ) as operator_sync,
-            patch.object(service, "trigger_anchor_transfer_async", return_value=True),
         ):
             result = service.process_feishu_record_change(
                 fs,
@@ -122,9 +142,9 @@ class FeishuLongConnectionTests(unittest.TestCase):
             )
 
         personnel_sync.assert_called_once()
-        self.assertEqual(2, read.call_count)
-        operator_sync.assert_called_once_with(fs, interview)
-        self.assertEqual(["对接运营账号（系统）", "03运营经济人"], result["updated"])
+        read.assert_called_once()
+        self.assertEqual(["对接运营账号（系统）"], result["updated"])
+        self.assertEqual(["15:00", "18:00"], result["result"]["anchor_transfer_schedule"]["daily_times"])
 
     def test_interview_event_never_writes_while_the_row_is_still_being_entered(self) -> None:
         fs = object()
@@ -139,8 +159,6 @@ class FeishuLongConnectionTests(unittest.TestCase):
         with (
             patch.object(service, "read_record", return_value=interview) as read,
             patch.object(service, "sync_one_interview_personnel_assignment") as personnel_sync,
-            patch.object(service, "sync_one_interview_operator_to_anchors") as operator_sync,
-            patch.object(service, "trigger_anchor_transfer_async") as trigger,
         ):
             result = service.process_feishu_record_change(
                 fs,
@@ -151,8 +169,6 @@ class FeishuLongConnectionTests(unittest.TestCase):
 
         read.assert_called_once_with(fs, service.TABLES["interview"], "rec-active")
         personnel_sync.assert_not_called()
-        operator_sync.assert_not_called()
-        trigger.assert_not_called()
         self.assertTrue(result["result"]["deferred"])
         self.assertEqual([], result["updated"])
 
