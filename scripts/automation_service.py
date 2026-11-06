@@ -11,7 +11,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 
 from mobile_interview_form import register_mobile_interview_form
-from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, ensure_interview_workflow_surface, ensure_personal_views, interview_allows_immediate_automation, read_record, request_json, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_anchor_numbers, sync_one_anchor_followup_to_interviews, sync_one_anchor_number, sync_one_anchor_operator_to_interviews, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory, sync_recent_interview_assignments
+from miyou_system_automation import APP_TOKEN, Feishu, OPENAPI, TABLES, build_chain, clear_premature_operator_assignments, ensure_interview_workflow_surface, ensure_personal_views, interview_allows_immediate_automation, read_record, request_json, should_clear_premature_operator, sync_anchor_display_names, sync_calendar, sync_interview_personnel_dropdowns, sync_interview_photos_to_anchors, sync_management_summary, sync_missing_anchor_numbers, sync_one_anchor_followup_to_interviews, sync_one_anchor_number, sync_one_anchor_operator_to_interviews, sync_one_interview_personnel_assignment, sync_operational_calendars, sync_person_assignment_fields, sync_personal_workbench_rows, sync_personnel_directory, sync_recent_interview_assignments
 from run_miyou_rule_engine import reconcile
 from sync_missing_personal_entries import sync_missing_personal_entries
 from sync_missing_workbench_rows import sync_missing_workbench_rows
@@ -37,6 +37,7 @@ LAST_FEISHU_RECORD_EVENT: dict[str, object] = {"received": False}
 LAST_FEISHU_CONTACT_EVENT: dict[str, object] = {"received": False}
 LAST_PERSONNEL_PROVISIONING: dict[str, object] = {"status": "not_run"}
 LAST_ANCHOR_TRANSFER: dict[str, object] = {"status": "not_run"}
+LAST_PREMATURE_OPERATOR_GUARD: dict[str, object] = {"status": "not_run"}
 FEISHU_LONG_CONNECTION_STATE: dict[str, object] = {"status": "disabled"}
 API_QUOTA_STATE: dict[str, object] = {"exhausted": False}
 PERSONNEL_WAKE_EVENT = threading.Event()
@@ -138,6 +139,7 @@ def scheduler_intervals() -> dict[str, int]:
         "personnel_probe": max(900, int(os.environ.get("PERSONNEL_PROBE_INTERVAL_SECONDS", "3600"))),
         "personnel": max(3600, int(os.environ.get("PERSONNEL_ENTRY_INTERVAL_SECONDS", "21600"))),
         "integrity": max(3600, int(os.environ.get("INTERVIEW_INTEGRITY_INTERVAL_SECONDS", "21600"))),
+        "premature_operator_guard": max(60, int(os.environ.get("PREMATURE_OPERATOR_GUARD_INTERVAL_SECONDS", "300"))),
         "reporting": max(21600, int(os.environ.get("REPORTING_INTERVAL_SECONDS", "86400"))),
     }
 
@@ -379,6 +381,41 @@ def run_interview_integrity_cycle() -> dict[str, object]:
     }
 
 
+def run_premature_operator_guard_cycle() -> dict[str, object]:
+    """Repair only recent confirmed default-operator rows without touching active input."""
+    fs = Feishu(tenant_token())
+    response = fs.api(
+        "POST",
+        f"/bitable/v1/apps/{APP_TOKEN}/tables/{TABLES['interview']}/records/search",
+        query={"page_size": 200},
+        body={"sort": [{"field_name": "系统：最后修改时间", "desc": True}]},
+    )
+    if response.get("code") != 0:
+        raise RuntimeError(f"Unable to scan recent interview records: {response}")
+    now_ms = int(time.time() * 1000)
+    quiet_seconds = max(15, int(os.environ.get("PREMATURE_OPERATOR_GUARD_QUIET_SECONDS", "60")))
+    cutoff_ms = now_ms - quiet_seconds * 1000
+    candidates: list[dict[str, object]] = []
+    for record in ((response.get("data") or {}).get("items") or []):
+        fields = record.get("fields") or {}
+        modified_at = fields.get("系统：最后修改时间")
+        if not isinstance(modified_at, (int, float)) or modified_at > cutoff_ms:
+            continue
+        if should_clear_premature_operator(fields):
+            candidates.append(record)
+    result = clear_premature_operator_assignments(fs, candidates)
+    LAST_PREMATURE_OPERATOR_GUARD.clear()
+    LAST_PREMATURE_OPERATOR_GUARD.update(
+        {
+            "status": "ok",
+            "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "quiet_seconds": quiet_seconds,
+            **result,
+        }
+    )
+    return result
+
+
 def run_anchor_transfer_cycle() -> dict[str, object]:
     """Process transfer flags without waiting for personnel, reporting, or calendar work."""
     if not service_enabled():
@@ -605,6 +642,13 @@ def background_scheduler() -> None:
             lambda: run_personnel_entry_cycle(wait_for_scan_seconds=120),
             PERSONNEL_WAKE_EVENT,
         ),
+        (
+            "Premature operator guard",
+            intervals["premature_operator_guard"],
+            20,
+            lambda: service_enabled(),
+            run_premature_operator_guard_cycle,
+        ),
         ("Interview integrity sync", intervals["integrity"], 120, personnel_dropdown_sync_enabled, run_interview_integrity_cycle),
         ("Reporting sync", intervals["reporting"], 180, lambda: service_enabled() and reporting_sync_enabled(), run_reporting_cycle),
     ]
@@ -714,6 +758,15 @@ def process_feishu_record_change(
     """Run the narrow maintenance required for one changed Base record."""
     if table_id == TABLES["interview"]:
         interview = read_record(fs, TABLES["interview"], record_id)
+        if should_clear_premature_operator(interview.get("fields") or {}):
+            repair = clear_premature_operator_assignments(fs, [interview])
+            return {
+                "result": {
+                    "record_id": record_id,
+                    "premature_operator_repair": repair,
+                },
+                "updated": ["对接运营", "对接运营账号（系统）"],
+            }
         if not interview_allows_immediate_automation(interview.get("fields") or {}):
             return {
                 "result": {
@@ -904,11 +957,12 @@ def health() -> object:
             "personnel_wake_pending": PERSONNEL_WAKE_EVENT.is_set(),
             "last_personnel_provisioning": last_provisioning,
             "last_anchor_transfer": last_anchor_transfer,
+            "last_premature_operator_guard": dict(LAST_PREMATURE_OPERATOR_GUARD),
             "anchor_transfer_wake_requested": False,
             "anchor_transfer_schedule_timezone": "Asia/Shanghai",
             "anchor_transfer_daily_times": anchor_schedule,
             "next_anchor_transfer_at": next_anchor_transfer_at().isoformat(timespec="minutes"),
-            "schema_version": "2026-11-02-twice-daily-anchor-transfer-v16",
+            "schema_version": "2026-11-06-clean-interview-form-operator-guard-v17",
             "active_batch": os.environ.get("AUTOMATION_ACTIVE_BATCH", ""),
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
         }

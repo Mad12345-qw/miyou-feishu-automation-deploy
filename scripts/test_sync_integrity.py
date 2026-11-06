@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 
 import sync_missing_personal_entries as personal
 import sync_missing_workbench_rows as workbench
-from miyou_system_automation import Feishu, TABLES, contact_api_with_retry, desired_anchor_number, find_existing_anchor_for_interview, keep_existing_fields, load_env, personnel_fields_changed, personnel_is_admin_locked, request_json, sync_linked_anchor_operators, sync_management_summary, sync_one_anchor_followup_to_interviews, sync_one_anchor_operator_to_interviews, sync_one_interview_followup_to_anchors, sync_one_interview_operator_to_anchors, sync_one_interview_personnel_assignment, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
+from miyou_system_automation import Feishu, TABLES, clear_premature_operator_assignments, contact_api_with_retry, desired_anchor_number, find_existing_anchor_for_interview, keep_existing_fields, load_env, personnel_fields_changed, personnel_is_admin_locked, request_json, sync_linked_anchor_operators, sync_management_summary, sync_one_anchor_followup_to_interviews, sync_one_anchor_operator_to_interviews, sync_one_interview_followup_to_anchors, sync_one_interview_operator_to_anchors, sync_one_interview_personnel_assignment, sync_recent_interview_assignments, sync_selected_interview_assignments, write_json
 from repair_live_data_integrity import CHILD_SPECS, plan_duplicate_child_cleanup
 from repair_duplicate_anchor_profiles import build_plan as build_duplicate_anchor_plan
 
@@ -805,6 +805,35 @@ class SyncIntegrityTests(unittest.TestCase):
         self.assertEqual(1, report["cleared_premature_operators"])
         self.assertEqual([], fs.updates[0]["fields"]["对接运营"])
         self.assertEqual([], fs.updates[0]["fields"]["对接运营账号（系统）"])
+
+    def test_narrow_default_guard_never_touches_completed_or_linked_rows(self) -> None:
+        class GuardFeishu:
+            def __init__(self) -> None:
+                self.updates = []
+
+            def batch_update(self, table_id, records, batch_size=100):
+                self.updates.extend(records)
+                return [{"code": 0}]
+
+        fs = GuardFeishu()
+        report = clear_premature_operator_assignments(
+            fs,
+            [
+                {"record_id": "rec_bad", "fields": {"对接运营": ["耿艳丽"]}},
+                {
+                    "record_id": "rec_completed",
+                    "fields": {"对接运营": ["耿艳丽"], "面试状态": "已完成"},
+                },
+                {
+                    "record_id": "rec_linked",
+                    "fields": {"对接运营": ["耿艳丽"], "关联主播档案": ["rec_anchor"]},
+                },
+            ],
+        )
+
+        self.assertEqual(1, report["cleared_records"])
+        self.assertEqual(["rec_bad"], report["record_ids"])
+        self.assertEqual(["rec_bad"], [item["record_id"] for item in fs.updates])
 
     def test_periodic_assignment_preserves_blocked_operator_after_interview(self) -> None:
         class AssignmentFeishu:

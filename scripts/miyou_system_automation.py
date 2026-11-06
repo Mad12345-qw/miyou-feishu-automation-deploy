@@ -481,6 +481,40 @@ def cleared_select_value(value: Any) -> Any:
     return [] if isinstance(value, list) else ""
 
 
+def clear_premature_operator_assignments(
+    fs: Feishu,
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Clear only the confirmed pre-interview operator default from supplied rows."""
+    updates: list[dict[str, Any]] = []
+    for record in records:
+        fields = record.get("fields") or {}
+        if not should_clear_premature_operator(fields):
+            continue
+        record_id = str(record.get("record_id") or "")
+        if not record_id:
+            continue
+        updates.append(
+            {
+                "record_id": record_id,
+                "fields": {
+                    "对接运营": cleared_select_value(fields.get("对接运营")),
+                    "对接运营账号（系统）": [],
+                },
+            }
+        )
+    results = fs.batch_update(TABLES["interview"], updates, batch_size=100) if updates else []
+    failures = [result for result in results if result.get("code") != 0]
+    if failures:
+        raise RuntimeError(f"Unable to clear premature operator assignments: {failures}")
+    return {
+        "scanned_records": len(records),
+        "cleared_records": len(updates),
+        "record_ids": [item["record_id"] for item in updates],
+        "results": results,
+    }
+
+
 def interview_operator_field_type(fs: Feishu, current_value: Any = None) -> int:
     try:
         field = next(

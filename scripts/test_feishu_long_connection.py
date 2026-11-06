@@ -146,7 +146,7 @@ class FeishuLongConnectionTests(unittest.TestCase):
         self.assertEqual(["对接运营账号（系统）"], result["updated"])
         self.assertEqual(["15:00", "18:00"], result["result"]["anchor_transfer_schedule"]["daily_times"])
 
-    def test_interview_event_never_writes_while_the_row_is_still_being_entered(self) -> None:
+    def test_interview_event_immediately_clears_confirmed_default_operator(self) -> None:
         fs = object()
         interview = {
             "record_id": "rec-active",
@@ -159,6 +159,11 @@ class FeishuLongConnectionTests(unittest.TestCase):
         with (
             patch.object(service, "read_record", return_value=interview) as read,
             patch.object(service, "sync_one_interview_personnel_assignment") as personnel_sync,
+            patch.object(
+                service,
+                "clear_premature_operator_assignments",
+                return_value={"cleared_records": 1, "record_ids": ["rec-active"]},
+            ) as clear_default,
         ):
             result = service.process_feishu_record_change(
                 fs,
@@ -169,6 +174,29 @@ class FeishuLongConnectionTests(unittest.TestCase):
 
         read.assert_called_once_with(fs, service.TABLES["interview"], "rec-active")
         personnel_sync.assert_not_called()
+        clear_default.assert_called_once_with(fs, [interview])
+        self.assertEqual(["对接运营", "对接运营账号（系统）"], result["updated"])
+
+    def test_interview_event_still_defers_unrelated_active_input(self) -> None:
+        fs = object()
+        interview = {
+            "record_id": "rec-active",
+            "fields": {"候选人姓名": "刚输入的姓名", "邀约时间": 1},
+        }
+        with (
+            patch.object(service, "read_record", return_value=interview),
+            patch.object(service, "sync_one_interview_personnel_assignment") as personnel_sync,
+            patch.object(service, "clear_premature_operator_assignments") as clear_default,
+        ):
+            result = service.process_feishu_record_change(
+                fs,
+                service.TABLES["interview"],
+                "rec-active",
+                "long_connection",
+            )
+
+        personnel_sync.assert_not_called()
+        clear_default.assert_not_called()
         self.assertTrue(result["result"]["deferred"])
         self.assertEqual([], result["updated"])
 

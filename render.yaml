@@ -55,6 +55,10 @@ services:
         value: "false"
       - key: ANCHOR_TRANSFER_DAILY_TIMES
         value: "15:00,18:00"
+      - key: PREMATURE_OPERATOR_GUARD_INTERVAL_SECONDS
+        value: "300"
+      - key: PREMATURE_OPERATOR_GUARD_QUIET_SECONDS
+        value: "60"
       - key: LEGACY_ASSIGNMENT_BACKFILL_ENABLED
         value: "false"
       - key: AUTOMATION_CUTOVER_MS
